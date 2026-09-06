@@ -168,7 +168,7 @@ export const appStorage = {
       .select("*")
       .order("saved_at", { ascending: false });
     if (error) throw error;
-    return data || [];
+    return (data || []).map((fit) => ({ ...fit, confirmed_fit: fit.confirmed_fit || "Not yet confirmed" }));
   },
 
   async uploadFitPhoto(file, fitId) {
@@ -188,6 +188,17 @@ export const appStorage = {
     const { data, error } = await requireSupabase()
       .from("saved_fits")
       .insert(fit)
+      .select()
+      .single();
+    if (error) throw error;
+    return data;
+  },
+
+  async updateFitConfirmation(id, confirmedFit) {
+    const { data, error } = await requireSupabase()
+      .from("saved_fits")
+      .update({ confirmed_fit: confirmedFit })
+      .eq("id", id)
       .select()
       .single();
     if (error) throw error;

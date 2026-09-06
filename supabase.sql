@@ -69,10 +69,14 @@ create table if not exists public.saved_fits (
   size text,
   material text,
   fit_verdict text not null,
+  confirmed_fit text not null default 'Not yet confirmed' check (confirmed_fit in ('Not yet confirmed', 'Fits', 'Doesn''t fit')),
   fit_reasoning text,
   original_text text not null,
   saved_at timestamptz not null default now()
 );
+
+alter table public.saved_fits add column if not exists confirmed_fit text not null default 'Not yet confirmed';
+update public.saved_fits set confirmed_fit = 'Not yet confirmed' where confirmed_fit is null or confirmed_fit not in ('Not yet confirmed', 'Fits', 'Doesn''t fit');
 
 insert into storage.buckets (id, name, public)
 values ('fit-photos', 'fit-photos', true)

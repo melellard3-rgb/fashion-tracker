@@ -37,6 +37,42 @@ app.post("/api/claude", async (req, res) => {
   }
 });
 
+app.post("/api/poshmark-listing", async (req, res) => {
+  const rawUrl = String(req.body?.url || "").trim();
+  let listingUrl;
+  try {
+    listingUrl = new URL(rawUrl);
+  } catch {
+    return res.status(400).json({ error: "Enter a valid Poshmark listing URL." });
+  }
+
+  if (!/(^|\.)poshmark\.[a-z.]+$/i.test(listingUrl.hostname)) {
+    return res.status(400).json({ error: "Only Poshmark listing URLs are supported." });
+  }
+
+  try {
+    const response = await fetch(listingUrl, {
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; BQI listing importer)" },
+    });
+    if (!response.ok) return res.status(502).json({ error: "Poshmark did not return this listing." });
+    const html = await response.text();
+    const meta = (property) => {
+      const match = html.match(new RegExp(`<meta[^>]+(?:property|name)=["']${property}["'][^>]+content=["']([^"']*)["']`, "i"));
+      return match ? decodeHtml(match[1]) : "";
+    };
+    const jsonLd = [...html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)]
+      .map((match) => { try { return JSON.parse(match[1]); } catch { return null; } })
+      .find(Boolean) || {};
+    const title = jsonLd.name || meta("og:title") || meta("twitter:title") || "";
+    const description = jsonLd.description || meta("og:description") || meta("description") || "";
+    const imageUrl = jsonLd.image?.url || jsonLd.image || meta("og:image") || meta("twitter:image") || "";
+    const image = imageUrl ? await fetchImageDataUrl(imageUrl) : null;
+    return res.json({ title, description, image });
+  } catch (error) {
+    return res.status(502).json({ error: "Could not fetch this Poshmark listing.", detail: error.message });
+  }
+});
+
 app.use(express.static(distPath));
 
 app.get(/.*/, (req, res) => {
@@ -46,3 +82,24 @@ app.get(/.*/, (req, res) => {
 app.listen(port, () => {
   console.log(`API server running at http://localhost:${port}`);
 });
+
+function decodeHtml(value) {
+  return value
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
+}
+
+async function fetchImageDataUrl(imageUrl) {
+  try {
+    const response = await fetch(imageUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
+    const contentType = response.headers.get("content-type") || "image/jpeg";
+    const bytes = await response.arrayBuffer();
+    if (bytes.byteLength > 8 * 1024 * 1024) return null;
+    return `data:${contentType};base64,${Buffer.from(bytes).toString("base64")}`;
+  } catch {
+    return null;
+  }
+}

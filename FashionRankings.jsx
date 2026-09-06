@@ -404,6 +404,9 @@ export default function FashionRankings() {
   const [sizeChartError, setSizeChartError] = useState(null);
 
   const [fitInput, setFitInput] = useState("");
+  const [poshmarkUrl, setPoshmarkUrl] = useState("");
+  const [poshmarkLoading, setPoshmarkLoading] = useState(false);
+  const [poshmarkError, setPoshmarkError] = useState(null);
   const [fitLoading, setFitLoading] = useState(false);
   const [fitResult, setFitResult] = useState(null);
   const [fitError, setFitError] = useState(null);
@@ -515,6 +518,7 @@ export default function FashionRankings() {
     setModalBrandId(id);
     setSizeCharts([]); setSizeChartIndex(0); setSizeChartError(null);
     setFitInput(""); setFitResult(null); setFitError(null);
+    setPoshmarkUrl(""); setPoshmarkError(null);
     setPriceGuide(null); setPriceGuideError(null);
     setSaveFitOpen(false); setSaveFitLabel(""); setSaveFitPhoto(null); setSaveFitError(null);
     setSaveFitConfirmed(false);
@@ -540,6 +544,7 @@ ${fitInput}`));
         fit_verdict: fitResult.verdict,
         fit_reasoning: fitResult.reasoning || null,
         original_text: fitInput,
+        confirmed_fit: "Not yet confirmed",
       });
       setSavedFits((current) => [saved, ...current]);
       setSaveFitOpen(false); setSaveFitLabel(""); setSaveFitPhoto(null);
@@ -557,6 +562,16 @@ ${fitInput}`));
       setSelectedFit(null);
     } catch (error) {
       console.error("Could not delete saved fit", error);
+    }
+  };
+
+  const updateFitConfirmation = async (fit, confirmedFit) => {
+    try {
+      const updated = await appStorage.updateFitConfirmation(fit.id, confirmedFit);
+      setSavedFits((current) => current.map((saved) => saved.id === fit.id ? { ...saved, ...updated } : saved));
+      setSelectedFit((current) => current && current.id === fit.id ? { ...current, ...updated } : current);
+    } catch (error) {
+      console.error("Could not update fit confirmation", error);
     }
   };
 
@@ -641,8 +656,8 @@ ${profileText}`;
     setSizeChartLoading(false);
   };
 
-  const runFitCheck = async (brandName) => {
-    if (!fitInput.trim()) return;
+  const runFitCheck = async (brandName, listingText = fitInput) => {
+    if (!listingText.trim()) return;
     setFitLoading(true); setFitError(null); setFitResult(null);
     try {
       const chartText = sizeCharts.length ? JSON.stringify(sizeCharts) : "no size chart available — use general knowledge of this brand's fit if you have it";
@@ -652,7 +667,7 @@ Brand: ${brandName}
 Brand size chart (body measurements by size): ${chartText}
 
 Listing details I'm considering (may include a size label and/or garment measurements, possibly laid-flat so double where relevant for circumference):
-"""${fitInput}"""
+"""${listingText}"""
 
 Assess whether this listing will fit me. Respond with ONLY raw JSON, no markdown fences, no other text, in exactly this shape:
 {"verdict":"good fit" or "tight" or "loose" or "unclear","recommendedSize":"e.g. size 4 / M","reasoning":"2-3 sentence explanation referencing the actual numbers"}`;
@@ -663,6 +678,34 @@ Assess whether this listing will fit me. Respond with ONLY raw JSON, no markdown
       setFitError("Couldn't check fit right now. Try again in a moment.");
     }
     setFitLoading(false);
+  };
+
+  const importPoshmarkListing = async () => {
+    if (!poshmarkUrl.trim()) return;
+    setPoshmarkLoading(true); setPoshmarkError(null);
+    try {
+      const response = await fetch("/api/poshmark-listing", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: poshmarkUrl.trim() }),
+      });
+      const listing = await response.json();
+      if (!response.ok) throw new Error(listing.error || "Could not import this listing.");
+      const listingText = [listing.title, listing.description].filter(Boolean).join("\n\n");
+      setFitInput(listingText);
+      if (listing.title) setSaveFitLabel(listing.title);
+      if (listing.image) {
+        const imageResponse = await fetch(listing.image);
+        const blob = await imageResponse.blob();
+        setSaveFitPhoto(new File([blob], "poshmark-listing.jpg", { type: blob.type || "image/jpeg" }));
+      } else {
+        setSaveFitPhoto(null);
+      }
+      await runFitCheck(modalBrand.name, listingText);
+    } catch (error) {
+      setPoshmarkError(error.message || "Could not import this listing.");
+    }
+    setPoshmarkLoading(false);
   };
 
   const fetchPriceGuide = async (brandName, brandId) => {
@@ -753,6 +796,11 @@ Assess whether this listing will fit me. Respond with ONLY raw JSON, no markdown
         <div style={{ borderTop: "1px solid #ded6ca", paddingTop: "12px", fontSize: "13px", color: "#665d53", lineHeight: 1.6 }}>
           {selectedFit.size && <div><strong>Size:</strong> {selectedFit.size}</div>}
           {selectedFit.material && <div><strong>Material:</strong> {selectedFit.material}</div>}
+          <div style={{ marginTop: "10px", display: "flex", alignItems: "center", flexWrap: "wrap", gap: "6px" }}>
+            <strong>Confirmed fit:</strong>
+            <button onClick={() => updateFitConfirmation(selectedFit, "Fits")} style={{ ...modalBtnStyle, padding: "5px 8px", color: selectedFit.confirmed_fit === "Fits" ? "#71806c" : "#514b43", borderColor: selectedFit.confirmed_fit === "Fits" ? "#71806c" : "#cfc6ba" }}>✓ Fits</button>
+            <button onClick={() => updateFitConfirmation(selectedFit, "Doesn't fit")} style={{ ...modalBtnStyle, padding: "5px 8px", color: selectedFit.confirmed_fit === "Doesn't fit" ? "#996c6c" : "#514b43", borderColor: selectedFit.confirmed_fit === "Doesn't fit" ? "#996c6c" : "#cfc6ba" }}>✗ Doesn't fit</button>
+          </div>
           {selectedFit.fit_reasoning && <div style={{ marginTop: "8px" }}>{selectedFit.fit_reasoning}</div>}
           <div style={{ marginTop: "12px", fontSize: "11px", color: "#81776b" }}>Saved {new Date(selectedFit.saved_at).toLocaleDateString()}</div>
         </div>
@@ -844,7 +892,7 @@ Assess whether this listing will fit me. Respond with ONLY raw JSON, no markdown
               <div key={brand} style={{ marginBottom: "18px" }}>
                 <h2 style={{ margin: "0 0 7px", fontSize: "16px", fontWeight: "normal", borderBottom: "1px solid #ded6ca", paddingBottom: "6px" }}>{brand}</h2>
                 {filteredSavedFits.filter((fit) => fit.brand === brand).map((fit) => (
-                  <button key={fit.id} onClick={() => setSelectedFit(fit)} style={{ display: "block", width: "100%", textAlign: "left", border: "1px solid #ded6ca", borderBottom: "none", background: "#fffdfa", padding: "10px 12px", cursor: "pointer", fontFamily: "inherit", color: "#302b25" }}><span>{fit.label}</span><span style={{ float: "right", color: "#967342", fontSize: "11px", textTransform: "capitalize" }}>{fit.fit_verdict}</span></button>
+                  <button key={fit.id} onClick={() => setSelectedFit(fit)} style={{ display: "block", width: "100%", textAlign: "left", border: "1px solid #ded6ca", borderBottom: "none", background: "#fffdfa", padding: "10px 12px", cursor: "pointer", fontFamily: "inherit", color: "#302b25" }}><span>{fit.label}</span><span style={{ float: "right", color: fit.confirmed_fit === "Fits" ? "#71806c" : fit.confirmed_fit === "Doesn't fit" ? "#996c6c" : "#967342", fontSize: "11px" }}>{fit.confirmed_fit || "Not yet confirmed"}</span></button>
                 ))}
               </div>
             ))}
@@ -853,7 +901,7 @@ Assess whether this listing will fit me. Respond with ONLY raw JSON, no markdown
             {filteredSavedFits.map((fit) => (
               <button key={fit.id} onClick={() => setSelectedFit(fit)} style={{ padding: 0, textAlign: "left", border: "1px solid #ded6ca", background: "#fffdfa", cursor: "pointer", fontFamily: "inherit", color: "#302b25" }}>
                 {fit.photo_url ? <img src={fit.photo_url} alt="" style={{ width: "100%", aspectRatio: "1 / 1.15", objectFit: "cover", display: "block" }} /> : <div style={{ width: "100%", aspectRatio: "1 / 1.15", background: "#eee8df", display: "flex", alignItems: "center", justifyContent: "center", color: "#b0a69a", fontSize: "11px", letterSpacing: "0.08em", textTransform: "uppercase" }}>No photo</div>}
-                <div style={{ padding: "9px 10px" }}><div style={{ fontSize: "13px" }}>{fit.label}</div><div style={{ fontSize: "10px", color: "#81776b", marginTop: "4px" }}>{fit.brand}</div></div>
+                <div style={{ padding: "9px 10px" }}><div style={{ fontSize: "13px" }}>{fit.label}</div><div style={{ fontSize: "10px", color: "#81776b", marginTop: "4px" }}>{fit.brand}</div><div style={{ fontSize: "10px", color: fit.confirmed_fit === "Fits" ? "#71806c" : fit.confirmed_fit === "Doesn't fit" ? "#996c6c" : "#967342", marginTop: "4px" }}>{fit.confirmed_fit || "Not yet confirmed"}</div></div>
               </button>
             ))}
           </div>}
@@ -1019,6 +1067,11 @@ Assess whether this listing will fit me. Respond with ONLY raw JSON, no markdown
             {/* Fit check */}
             <div style={{ marginBottom: "8px" }}>
               <div style={{ fontSize: "10px", letterSpacing: "0.15em", color: "#81776b", textTransform: "uppercase", marginBottom: "10px" }}>Check Fit</div>
+              <div style={{ display: "flex", gap: "7px", marginBottom: "8px" }}>
+                <input value={poshmarkUrl} onChange={(e) => setPoshmarkUrl(e.target.value)} placeholder="Paste Poshmark link" style={{ ...fieldStyle, padding: "9px 10px" }} />
+                <button onClick={importPoshmarkListing} disabled={poshmarkLoading || !poshmarkUrl.trim()} style={{ ...modalBtnStyle, flexShrink: 0 }}>{poshmarkLoading ? "Importing..." : "Import"}</button>
+              </div>
+              {poshmarkError && <div style={{ fontSize: "11px", color: "#996c6c", marginBottom: "8px" }}>{poshmarkError}</div>}
               <textarea
                 value={fitInput}
                 onChange={(e) => setFitInput(e.target.value)}
