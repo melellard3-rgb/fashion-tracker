@@ -1,8 +1,12 @@
 import "dotenv/config";
 import express from "express";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const app = express();
 const port = Number(process.env.PORT || 8787);
+const projectRoot = path.dirname(fileURLToPath(import.meta.url));
+const distPath = path.join(projectRoot, "..", "dist");
 
 app.use(express.json({ limit: "1mb" }));
 
@@ -31,6 +35,12 @@ app.post("/api/claude", async (req, res) => {
   } catch (error) {
     return res.status(502).json({ error: "Could not reach Anthropic.", detail: error.message });
   }
+});
+
+app.use(express.static(distPath));
+
+app.get(/.*/, (req, res) => {
+  res.sendFile(path.join(distPath, "index.html"));
 });
 
 app.listen(port, () => {
