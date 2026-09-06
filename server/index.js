@@ -31,6 +31,13 @@ app.post("/api/claude", async (req, res) => {
       body: JSON.stringify(body),
     });
     const data = await response.json();
+    if (!response.ok) {
+      console.error("Anthropic request failed", {
+        status: response.status,
+        type: data?.error?.type,
+        message: data?.error?.message,
+      });
+    }
     return res.status(response.status).json(data);
   } catch (error) {
     return res.status(502).json({ error: "Could not reach Anthropic.", detail: error.message });
@@ -63,8 +70,8 @@ app.post("/api/poshmark-listing", async (req, res) => {
     const jsonLd = [...html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)]
       .map((match) => { try { return JSON.parse(match[1]); } catch { return null; } })
       .find(Boolean) || {};
-    const title = jsonLd.name || meta("og:title") || meta("twitter:title") || "";
-    const description = jsonLd.description || meta("og:description") || meta("description") || "";
+    const title = sanitizeListingText(jsonLd.name || meta("og:title") || meta("twitter:title") || "");
+    const description = sanitizeListingText(jsonLd.description || meta("og:description") || meta("description") || "");
     const imageUrl = jsonLd.image?.url || jsonLd.image || meta("og:image") || meta("twitter:image") || "";
     const image = imageUrl ? await fetchImageDataUrl(imageUrl) : null;
     return res.json({ title, description, image });
@@ -89,7 +96,19 @@ function decodeHtml(value) {
     .replace(/&quot;/g, '"')
     .replace(/&#39;|&apos;/g, "'")
     .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">");
+    .replace(/&gt;/g, ">")
+    .replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([\da-f]+);/gi, (_, code) => String.fromCodePoint(parseInt(code, 16)));
+}
+
+function sanitizeListingText(value) {
+  return decodeHtml(String(value))
+    .replace(/<[^>]*>/g, " ")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n\s+/g, "\n")
+    .trim()
+    .slice(0, 12000);
 }
 
 async function fetchImageDataUrl(imageUrl) {

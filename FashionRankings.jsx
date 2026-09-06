@@ -302,7 +302,7 @@ function Medal({ rank }) {
 // ---- AI helper ----
 async function askClaude(prompt, useWebSearch) {
   const body = {
-    model: "claude-sonnet-4-6",
+    model: "claude-haiku-4-5-20251001",
     max_tokens: 1200,
     messages: [{ role: "user", content: prompt }],
   };
@@ -315,7 +315,7 @@ async function askClaude(prompt, useWebSearch) {
     body: JSON.stringify({ body }),
   });
   const data = await res.json();
-  if (!res.ok) throw new Error(data.error || "The AI request failed");
+  if (!res.ok) throw new Error(data.error?.message || data.error || "The AI request failed");
   const text = (data.content || [])
     .filter((b) => b.type === "text")
     .map((b) => b.text)
@@ -328,6 +328,18 @@ function extractJSON(text) {
   const match = cleaned.match(/\{[\s\S]*\}/);
   if (!match) throw new Error("No JSON in response");
   return JSON.parse(match[0]);
+}
+
+function sanitizeListingText(text) {
+  const textarea = document.createElement("textarea");
+  textarea.innerHTML = String(text || "");
+  return textarea.value
+    .replace(/<[^>]*>/g, " ")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n\s+/g, "\n")
+    .trim()
+    .slice(0, 12000);
 }
 
 const btnStyle = (active) => ({
@@ -691,7 +703,7 @@ Assess whether this listing will fit me. Respond with ONLY raw JSON, no markdown
       });
       const listing = await response.json();
       if (!response.ok) throw new Error(listing.error || "Could not import this listing.");
-      const listingText = [listing.title, listing.description].filter(Boolean).join("\n\n");
+      const listingText = sanitizeListingText([listing.title, listing.description].filter(Boolean).join("\n\n"));
       setFitInput(listingText);
       if (listing.title) setSaveFitLabel(listing.title);
       if (listing.image) {
