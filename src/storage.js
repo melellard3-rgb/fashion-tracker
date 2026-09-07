@@ -139,6 +139,21 @@ export const appStorage = {
     }));
 
     const ranked = (rankings || []).map(({ brand_id, tier }) => ({ id: brand_id, tier }));
+
+    // Loading is otherwise a read, but it backfills an F ranking for any brand
+    // that has none. That backfill is only ever meant to patch a stray gap.
+    // When an account has brands and NOT ONE ranking, the cause is upstream —
+    // a half-applied migration, or a wiped table — and writing F across the
+    // whole catalog destroys the real tiers rather than repairing anything.
+    // Refuse, and let the caller surface it.
+    if (!ranked.length && normalizedBrands.length) {
+      throw new Error(
+        `Found ${normalizedBrands.length} brands but no rankings at all for this account. ` +
+        `Refusing to reset every brand to F — your tiers are still in the database or a backup. ` +
+        `Restore the rankings table before using the app.`
+      );
+    }
+
     const rankedIds = new Set(ranked.map((entry) => entry.id));
     const missingRankings = normalizedBrands
       .filter((brand) => !rankedIds.has(brand.id))
@@ -156,15 +171,25 @@ export const appStorage = {
     const client = requireSupabase();
     const userId = await requireUserId();
 
+    // Nothing at all to persist — usually a failed load. Don't even round-trip.
+    if (!brands.length && !ranked.length) return;
+
     const { error: brandsError } = await client
       .from("brands")
       .upsert(brands.map((brand) => ({ ...brand, user_id: userId })));
     if (brandsError) throw brandsError;
 
+    // Nothing to write means nothing to replace. This guard has to sit BEFORE
+    // the delete: an earlier version deleted every ranking row first and only
+    // then returned on an empty `ranked`, so one failed load was enough to wipe
+    // every tier the account had. Brand removal goes through deleteBrand(),
+    // whose foreign key cascades the ranking away, so no legitimate flow needs
+    // the delete-and-bail path.
+    if (!ranked.length) return;
+
     // Replace this user's rankings only — never touch anyone else's rows.
     const { error: deleteError } = await client.from("rankings").delete().eq("user_id", userId);
     if (deleteError) throw deleteError;
-    if (!ranked.length) return;
 
     const rankedIds = new Set(ranked.map((entry) => entry.id));
     const completeRanked = [
@@ -245,7 +270,11 @@ export const appStorage = {
 
   // ---- Profile -------------------------------------------------------------
 
-  async getProfile(defaultProfile) {
+  // A brand-new account starts with an empty profile. It must never be seeded
+  // from a hard-coded default: that default held one real person's name and
+  // body measurements, so every new signup was silently given them — and it
+  // also made a wrong-account session look like a working one.
+  async getProfile() {
     const client = requireSupabase();
     const userId = await requireUserId();
     const { data, error } = await client
@@ -258,13 +287,10 @@ export const appStorage = {
       return { name: data.name || "", measurements: data.measurements || {} };
     }
 
-    const { error: seedError } = await client.from("profile").insert({
-      user_id: userId,
-      name: defaultProfile.name,
-      measurements: defaultProfile.measurements,
-    });
+    const empty = { name: "", measurements: {} };
+    const { error: seedError } = await client.from("profile").insert({ user_id: userId, ...empty });
     if (seedError && seedError.code !== "23505") throw seedError;
-    return defaultProfile;
+    return empty;
   },
 
   async setProfile(profile) {

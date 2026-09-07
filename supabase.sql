@@ -1,10 +1,13 @@
 -- BQI Fashion Tracker — multi-user schema, RLS, and one-time migration.
 --
--- Safe to run repeatedly. Run it once now; if your auth user does not exist yet
--- (you have not completed a magic-link login), the migration block at the end
--- reports a notice and does nothing. After your first login, run
---   select public.claim_legacy_bqi_data('melellard3@gmail.com');
--- to attach all pre-existing data to your account.
+-- ORDER MATTERS: sign in to the app with the magic link FIRST, then run this.
+-- The auth user has to exist before the migration can hand your data to it.
+-- If it does not, the preflight in section 0 raises an exception and the whole
+-- script is rolled back — no schema changes, no data loss, but also no
+-- migration. Sign in and run the script again.
+--
+-- Safe to run repeatedly. When it finishes, section 8 prints a per-account row
+-- count; if you do not see that result grid, the script did not complete.
 
 -- ---------------------------------------------------------------------------
 -- 0. Preflight guard
@@ -36,9 +39,15 @@ begin
 
   if legacy_count > 0 and target_id is null then
     raise exception
-      'BQI migration stopped: found % pre-existing brands but no auth user for melellard3@gmail.com. Sign in once with the magic link, then re-run this script so that data is migrated to your account instead of dropped.',
+      E'BQI MIGRATION DID NOT RUN — NO CHANGES WERE MADE.\n'
+      '  Found % existing brands, but no auth user exists for melellard3@gmail.com yet.\n'
+      '  Migrating now would leave that data unowned and it would be deleted.\n'
+      '  Fix: open the app, sign in with the magic link, then run this whole script again.\n'
+      '  Your data is untouched. This script is transactional — nothing above was applied.',
       legacy_count;
   end if;
+
+  raise notice 'Preflight OK: % existing brands, target user %.', legacy_count, coalesce(target_id::text, '(none — fresh project)');
 end;
 $$;
 
@@ -347,3 +356,37 @@ create policy "Owner fit photo updates" on storage.objects for update to authent
   using (bucket_id = 'fit-photos' and (storage.foldername(name))[1] = auth.uid()::text);
 create policy "Owner fit photo deletes" on storage.objects for delete to authenticated
   using (bucket_id = 'fit-photos' and (storage.foldername(name))[1] = auth.uid()::text);
+
+-- ---------------------------------------------------------------------------
+-- 8. Verification report
+--
+-- The SQL editor shows the last SELECT as a result grid, so success or failure
+-- is visible rather than assumed. Every account should show its own counts, and
+-- the row for melellard3@gmail.com should carry the full migrated catalog.
+-- If this grid does not appear, the script did not finish — scroll up for the
+-- error and re-run after fixing it.
+-- ---------------------------------------------------------------------------
+
+do $$
+declare
+  orphan_brands integer;
+begin
+  select count(*) into orphan_brands from public.brands where user_id is null;
+  if orphan_brands > 0 then
+    raise warning 'BQI: % brands are still unowned.', orphan_brands;
+  else
+    raise notice 'BQI migration complete — every row is owned by an account.';
+  end if;
+end;
+$$;
+
+select
+  u.email,
+  u.id                                                                          as auth_user_id,
+  (select count(*) from public.brands      b where b.user_id = u.id)            as brands,
+  (select count(*) from public.rankings     r where r.user_id = u.id)           as rankings,
+  (select count(*) from public.profile      p where p.user_id = u.id)           as profile_rows,
+  (select count(*) from public.saved_fits   f where f.user_id = u.id)           as saved_fits,
+  (select s.seeded from public.user_setup   s where s.user_id = u.id)           as onboarded
+from auth.users u
+order by u.created_at;

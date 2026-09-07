@@ -275,22 +275,10 @@ const TIER_CONFIG = [
   { label: "F", color: "#996c6c", bg: "#f0e5e3", desc: "Skip" },
 ];
 
-const DEFAULT_PROFILE = {
-  name: "Mel",
-  measurements: {
-    bustIn: 32.48,
-    highBustIn: 32.09,
-    underbustIn: 30.51,
-    waistIn: 27.4,
-    backWidthIn: 16.14,
-    shoulderIn: 7.28,
-    backShoulderIn: 14.96,
-    neckToBustIn: 5.71,
-    waistToFloorIn: 41.34,
-    chestToFloorIn: 54.72,
-    shoeSize: "8.5 (sometimes 8)",
-  },
-};
+// A new account starts empty. This used to hold one person's real name and
+// measurements, which meant every new signup inherited them — and it masked a
+// broken load, because the unfetched initial state looked like real data.
+const EMPTY_PROFILE = { name: "", measurements: {} };
 
 function Medal({ rank }) {
   if (rank === 1) return <span style={{ fontSize: "12px" }}>🥇</span>;
@@ -517,7 +505,7 @@ export default function FashionRankings() {
   const [priceGuide, setPriceGuide] = useState(null); // { retailLow, retailHigh, resaleLow, resaleHigh, goodBuyUnder, notes, fetchedAt }
   const [priceGuideLoading, setPriceGuideLoading] = useState(false);
   const [priceGuideError, setPriceGuideError] = useState(null);
-  const [profile, setProfile] = useState(DEFAULT_PROFILE);
+  const [profile, setProfile] = useState(EMPTY_PROFILE);
   const [profileText, setProfileText] = useState("");
   const [profileLoading, setProfileLoading] = useState(false);
   const [profileError, setProfileError] = useState(null);
@@ -542,6 +530,7 @@ export default function FashionRankings() {
   const [authSent, setAuthSent] = useState(false);
   const [authError, setAuthError] = useState(null);
   const [setupChecked, setSetupChecked] = useState(false);
+  const [loadError, setLoadError] = useState(null);
   const [needsSeedChoice, setNeedsSeedChoice] = useState(false);
   const [seeding, setSeeding] = useState(false);
   const [seedError, setSeedError] = useState(null);
@@ -572,6 +561,7 @@ export default function FashionRankings() {
     if (!session) {
       setSetupChecked(false);
       setLoaded(false);
+      setLoadError(null);
       return;
     }
     let cancelled = false;
@@ -586,7 +576,7 @@ export default function FashionRankings() {
         }
         setNeedsSeedChoice(false);
         const saved = await appStorage.load();
-        const savedProfile = await appStorage.getProfile(DEFAULT_PROFILE);
+        const savedProfile = await appStorage.getProfile();
         if (cancelled) return;
         setBrands(saved.brands);
         setRanked(saved.ranked);
@@ -598,10 +588,14 @@ export default function FashionRankings() {
         } catch (savedFitError) {
           console.error("Could not load saved fit checks", savedFitError);
         }
-        if (!cancelled) setLoaded(true);
+        if (!cancelled) { setLoadError(null); setLoaded(true); }
       } catch (error) {
+        // Previously this fell through to setLoaded(true) with no brands, which
+        // rendered an empty tier board and looked like "all my data vanished".
+        // Surface the real failure instead — and leave `loaded` false so the
+        // save effect can't persist the empty state over good data.
         console.error("Could not load Fashion Tracker data", error);
-        if (!cancelled) setLoaded(true);
+        if (!cancelled) setLoadError(error);
       }
       if (!cancelled) setSetupChecked(true);
     }
@@ -610,11 +604,11 @@ export default function FashionRankings() {
   }, [session]);
 
   useEffect(() => {
-    if (!loaded || !session || needsSeedChoice) return;
+    if (!loaded || !session || needsSeedChoice || loadError) return;
     appStorage.save(brands, ranked).catch((error) => {
       console.error("Could not save Fashion Tracker data", error);
     });
-  }, [brands, ranked, loaded, session, needsSeedChoice]);
+  }, [brands, ranked, loaded, session, needsSeedChoice, loadError]);
 
   const sendMagicLink = async (event) => {
     event.preventDefault();
@@ -633,7 +627,7 @@ export default function FashionRankings() {
     setSeeding(true); setSeedError(null);
     try {
       const seeded = await appStorage.seedCatalog(choice, categorizedBrands, initialRanked);
-      const savedProfile = await appStorage.getProfile(DEFAULT_PROFILE);
+      const savedProfile = await appStorage.getProfile();
       setBrands(seeded.brands);
       setRanked(seeded.ranked);
       setProfile(savedProfile);
@@ -1071,6 +1065,32 @@ Respond with ONLY raw JSON, no markdown fences, no other text, in exactly this s
       <button onClick={() => appAuth.signOut()} style={{ ...modalBtnStyle, marginTop: "20px" }}>Sign out</button>
     </div></div>
   );
+
+  // A load failure must never look like an empty list.
+  if (loadError) {
+    const message = String(loadError?.message || loadError);
+    const schemaMissing = /user_setup|does not exist|schema cache|PGRST20[25]/i.test(message);
+    return (
+      <div style={shellStyle}><div style={{ ...cardStyle, maxWidth: "560px" }}>
+        {wordmark}
+        <div style={{ fontSize: "10px", letterSpacing: "0.15em", color: "#996c6c", textTransform: "uppercase", marginBottom: "16px" }}>Couldn't load your data</div>
+        {schemaMissing ? (
+          <div style={{ fontSize: "13px", color: "#665d53", lineHeight: 1.6, marginBottom: "14px" }}>
+            Your account is signed in, but the database hasn't been migrated to the multi-user schema yet — so the app can't see your brands. <strong>Your data is safe and untouched.</strong> Run <code>supabase.sql</code> in the Supabase SQL editor, then reload this page.
+          </div>
+        ) : (
+          <div style={{ fontSize: "13px", color: "#665d53", lineHeight: 1.6, marginBottom: "14px" }}>
+            Something went wrong reading your list. Nothing has been changed or overwritten.
+          </div>
+        )}
+        <div style={{ fontSize: "11px", color: "#81776b", fontFamily: "monospace", background: "#f7f3ed", border: "1px solid #ded6ca", padding: "10px 12px", overflowWrap: "anywhere", marginBottom: "16px" }}>{message}</div>
+        <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+          <button onClick={() => window.location.reload()} style={btnStyle(true)}>Reload</button>
+          <button onClick={() => appAuth.signOut()} style={modalBtnStyle}>Sign out</button>
+        </div>
+      </div></div>
+    );
+  }
 
   if (!loaded) return (
     <div style={{ minHeight: "100vh", background: "#f7f3ed", display: "flex", alignItems: "center", justifyContent: "center", color: "#8b8175", fontFamily: "Georgia, serif" }}>loading...</div>
