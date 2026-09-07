@@ -288,10 +288,10 @@ function Medal({ rank }) {
 }
 
 // ---- AI helper ----
-async function askClaude(prompt, useWebSearch) {
+async function askClaude(prompt, useWebSearch, maxTokens = 2000) {
   const body = {
     model: "claude-haiku-4-5-20251001",
-    max_tokens: 2000,
+    max_tokens: maxTokens,
     messages: [{ role: "user", content: prompt }],
   };
   if (useWebSearch) {
@@ -373,6 +373,32 @@ function findSimilarBrands(query, brands, limit = 3) {
     .sort((a, b) => b.score - a.score)
     .slice(0, limit)
     .map(({ brand }) => brand);
+}
+
+// Cheap name-only lookup: "which real brands might this be?". No web search,
+// tiny token budget, and it returns nothing but names. Deliberately separate
+// from researchBrandTier below, which is the expensive call.
+async function suggestBrandNames(query) {
+  const prompt = `A user typed "${query}" into a fashion brand search box. It may be a misspelling of a real clothing, footwear, or accessories brand.
+
+List up to 5 REAL fashion brand names it could plausibly be. Names only — no descriptions, no commentary, no invented brands. If nothing plausible comes to mind, return an empty list.
+
+Respond with ONLY raw JSON, no markdown fences, no other text:
+{"names":["Brand One","Brand Two"]}`;
+  const parsed = extractJSON(await askClaude(prompt, false, 200));
+  const names = Array.isArray(parsed.names) ? parsed.names : [];
+  // The model sometimes repeats a name or varies its casing between entries.
+  const seen = new Set();
+  const unique = [];
+  for (const value of names) {
+    if (typeof value !== "string" || !value.trim()) continue;
+    const name = value.trim();
+    const key = normalizeBrandName(name);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    unique.push(name);
+  }
+  return unique.slice(0, 5);
 }
 
 // Researches a genuinely new brand so it starts at a sensible tier instead of
@@ -543,14 +569,7 @@ export default function FashionRankings() {
   const [seedError, setSeedError] = useState(null);
 
   // "Did you mean" / new-brand research
-  const [tierSuggestion, setTierSuggestion] = useState(null); // { name, tier, reasoning, notes, categories }
-  const [tierResearching, setTierResearching] = useState(false);
-  const [tierError, setTierError] = useState(null);
-  const [dismissedSuggestions, setDismissedSuggestions] = useState([]);
-  // The term the currently displayed research belongs to, plus a sequence
-  // number so a slow reply for an earlier term cannot land on a newer one.
-  const researchedTermRef = useRef("");
-  const researchSeqRef = useRef(0);
+
   // Extra listing detail typed after a first Check Fit result.
   const [moreInfo, setMoreInfo] = useState("");
   // Manual size chart entry.
@@ -559,6 +578,12 @@ export default function FashionRankings() {
   const [manualChartError, setManualChartError] = useState(null);
   const [deletingBrand, setDeletingBrand] = useState(null);
   const [confirmRemoveBrand, setConfirmRemoveBrand] = useState(null);
+  // Name-only suggestions from the cheap lookup, and the brand currently being
+  // researched after it has already been placed on the chart.
+  const [nameSuggestions, setNameSuggestions] = useState([]);
+  const [nameSuggestLoading, setNameSuggestLoading] = useState(false);
+  const [placingBrandId, setPlacingBrandId] = useState(null);
+  const nameSuggestSeqRef = useRef(0);
 
   useEffect(() => {
     let unsubscribe = () => {};
@@ -648,18 +673,52 @@ export default function FashionRankings() {
     return () => { cancelled = true; };
   }, [dirty, brands, ranked, loaded, session, needsSeedChoice, loadError]);
 
-  // Research is tied to the exact text it was run for. Editing the search box
-  // (e.g. "Boss" -> "Hugo Boss") must clear the old brand's description rather
-  // than leave it sitting under a different query.
+  // Debounced, name-only lookup for "did you mean". It runs only once typing
+  // settles, only for a search long enough to be meaningful, and only when the
+  // local catalog has no exact match — so it never fires per keystroke. This is
+  // the cheap call; the expensive research still happens on Add and rank alone.
   useEffect(() => {
-    if (search.trim() === researchedTermRef.current) return;
-    researchedTermRef.current = "";
-    setTierSuggestion(null);
-    setTierError(null);
-    setTierResearching(false);
-    setAddCategoryOpen(false);
-    setNewBrandCategories(["Clothing"]);
-  }, [search]);
+    const term = search.trim();
+    // The "does this already exist" test is recomputed here rather than reusing
+    // `existingSearchBrand`: that const is declared further down the component,
+    // so referencing it from a hook this high up is a temporal dead zone error
+    // that takes the whole app down at runtime.
+    const lower = term.toLowerCase();
+    const key = normalizeBrandName(term);
+    const alreadyExists = brands.some((brand) =>
+      brand.name.toLowerCase().includes(lower) || normalizeBrandName(brand.name) === key);
+    if (term.length < 3 || alreadyExists || addCategoryOpen) {
+      setNameSuggestions([]);
+      setNameSuggestLoading(false);
+      return;
+    }
+    const seq = ++nameSuggestSeqRef.current;
+    setNameSuggestions([]);
+    const timer = setTimeout(async () => {
+      setNameSuggestLoading(true);
+      try {
+        const names = await suggestBrandNames(term);
+        if (seq !== nameSuggestSeqRef.current) return;
+        // A suggested name that IS already in the catalog is kept, not dropped:
+        // that is the most useful case — clicking it fills the box and the
+        // board filters to the brand the user actually meant. Only the typed
+        // term itself and names already offered by the local fuzzy match are
+        // filtered out, to avoid showing the same name twice.
+        const alreadyOffered = new Set(
+          findSimilarBrands(term, brands).map((brand) => normalizeBrandName(brand.name))
+        );
+        setNameSuggestions(names.filter((name) => {
+          const nameKey = normalizeBrandName(name);
+          return nameKey && nameKey !== key && !alreadyOffered.has(nameKey);
+        }));
+      } catch (error) {
+        if (seq === nameSuggestSeqRef.current) setNameSuggestions([]);
+      }
+      if (seq === nameSuggestSeqRef.current) setNameSuggestLoading(false);
+    }, 700);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search, brands, addCategoryOpen]);
 
   const sendMagicLink = async (event) => {
     event.preventDefault();
@@ -734,39 +793,37 @@ export default function FashionRankings() {
     setDragOver(null);
   };
 
-  const handleAddBrand = (brandName, categories = ["Clothing"], tier = "F", notes = "") => {
+  // Adds the brand straight onto the chart, then researches its tier in the
+  // background and moves it. There is no review step: the user ends up looking
+  // at the board with the brand already on it, free to drag it elsewhere.
+  const addAndPlaceBrand = async (brandName, categories) => {
     const name = brandName.trim();
     if (!name) return;
+
     const newId = nextId.current++;
-    setBrands((prev) => [...prev, { id: newId, name, notes, categories }]);
-    setRanked((prev) => [...prev, { id: newId, tier }]);
-    setDirty(true);
+    setBrands((prev) => [...prev, { id: newId, name, notes: "", categories }]);
+    setRanked((prev) => [...prev, { id: newId, tier: "F" }]);
     setNewestId(newId);
+    setDirty(true);
+    setPlacingBrandId(newId);
+
+    // Leave search immediately so the chart — with the new brand on it — is
+    // what the user is looking at while the lookup runs.
+    setSearch("");
+    setNameSuggestions([]);
     setAddCategoryOpen(false);
     setNewBrandCategories(["Clothing"]);
-    setTierSuggestion(null);
-    setTierError(null);
-    setSearch("");
-  };
 
-  // Looks the brand up before adding it so it lands on a researched tier rather
-  // than defaulting to F. The user can still change the tier before saving.
-  const researchNewBrand = async (brandName) => {
-    const term = brandName.trim();
-    const seq = ++researchSeqRef.current;
-    researchedTermRef.current = term;
-    setTierResearching(true); setTierError(null); setTierSuggestion(null);
     try {
-      const suggestion = await researchBrandTier(term);
-      // Drop the reply if the search moved on while it was in flight.
-      if (seq !== researchSeqRef.current || researchedTermRef.current !== term) return;
-      setTierSuggestion({ name: term, ...suggestion });
-      setNewBrandCategories(suggestion.categories);
+      const suggestion = await researchBrandTier(name);
+      setRanked((prev) => prev.map((entry) => entry.id === newId ? { ...entry, tier: suggestion.tier } : entry));
+      setBrands((prev) => prev.map((brand) => brand.id === newId ? { ...brand, notes: suggestion.notes || brand.notes } : brand));
+      setDirty(true);
     } catch (error) {
-      if (seq !== researchSeqRef.current || researchedTermRef.current !== term) return;
-      setTierError("Couldn't research this brand right now — you can still add it and set the tier yourself.");
+      // Keep the brand where it landed; the user can drag it.
+      console.error("Could not research the new brand", error);
     }
-    if (seq === researchSeqRef.current) setTierResearching(false);
+    setPlacingBrandId(null);
   };
 
   const removeBrand = async (brandId) => {
@@ -1110,6 +1167,7 @@ Respond with ONLY raw JSON, no markdown fences, no other text, in exactly this s
           {b.name}
         </span>
         {isNew && <span style={{ fontSize: "9px", background: "#967342", color: "#fffdfa", borderRadius: "0", padding: "2px 5px", fontWeight: "bold", letterSpacing: "0.08em" }}>NEW</span>}
+        {placingBrandId === id && <span data-testid="placing" style={{ fontSize: "9px", color: "#81776b", fontStyle: "italic", letterSpacing: "0.06em" }}>finding tier...</span>}
       </div>
     );
   };
@@ -1240,7 +1298,7 @@ Respond with ONLY raw JSON, no markdown fences, no other text, in exactly this s
   const existingSearchBrand = normalizedSearch ? brands.some(matchesSearch) : false;
   // Close-but-not-exact catalog entries, offered before adding anything new.
   const similarBrands = normalizedSearch && !existingSearchBrand
-    ? findSimilarBrands(search, brands).filter((brand) => !dismissedSuggestions.includes(brand.id))
+    ? findSimilarBrands(search, brands)
     : [];
   const brandMatchesCategory = (brand) => Boolean(brand) && (categoryFilter === "All" || (brand.categories || ["Clothing"]).includes(categoryFilter));
   const normalizedClosetSearch = closetSearch.trim().toLowerCase();
@@ -1286,13 +1344,13 @@ Respond with ONLY raw JSON, no markdown fences, no other text, in exactly this s
 
   // The X on the search box: leave search completely, without discarding the
   // board or stranding the user on a search-only screen.
+  // The X on the search box: leave search completely, without discarding the
+  // board or stranding the user on a search-only screen.
   const clearSearch = () => {
     setSearch("");
+    setNameSuggestions([]);
+    setNameSuggestLoading(false);
     setAddCategoryOpen(false);
-    setTierSuggestion(null);
-    setTierError(null);
-    setTierResearching(false);
-    setDismissedSuggestions([]);
     setNewBrandCategories(["Clothing"]);
   };
 
@@ -1432,101 +1490,84 @@ Respond with ONLY raw JSON, no markdown fences, no other text, in exactly this s
 
       {normalizedSearch && !existingSearchBrand && (
         <div style={{ marginBottom: "12px" }}>
-          {/* Near matches come from local string distance only — no API call.
-              A misspelling should not quietly become a duplicate brand. */}
-          {similarBrands.length > 0 && (
+          {/* Names only. Catalog matches are free (local string distance); the
+              rest come from a cheap name-only lookup. Clicking either just
+              fills the search box and re-runs the check. */}
+          {(similarBrands.length > 0 || nameSuggestions.length > 0 || nameSuggestLoading) && !addCategoryOpen && (
             <div data-testid="did-you-mean" style={{ padding: "10px 12px", marginBottom: "10px", border: "1px solid #ded6ca", background: "#fffdfa" }}>
-              <div style={{ fontSize: "12px", color: "#665d53", marginBottom: "8px" }}>
-                Did you mean{similarBrands.length > 1 ? " one of these" : ""}?
-              </div>
+              <div style={{ fontSize: "12px", color: "#665d53", marginBottom: "8px" }}>Did you mean?</div>
               <div style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
                 {similarBrands.map((brand) => (
                   <button
-                    key={brand.id}
-                    data-testid={`suggestion-${brand.id}`}
-                    onClick={() => { setSearch(brand.name); openBrandModal(brand.id); }}
+                    key={`own-${brand.id}`}
+                    data-testid="suggestion"
+                    onClick={() => setSearch(brand.name)}
                     style={{ ...modalBtnStyle, borderColor: "#967342", color: "#211d17" }}
                   >
                     {brand.name}
                   </button>
                 ))}
+                {nameSuggestions.map((name) => (
+                  <button
+                    key={`new-${name}`}
+                    data-testid="suggestion"
+                    onClick={() => setSearch(name)}
+                    style={modalBtnStyle}
+                  >
+                    {name}
+                  </button>
+                ))}
               </div>
+              {nameSuggestLoading && (
+                <div data-testid="suggestions-loading" style={{ fontSize: "11px", color: "#81776b", marginTop: "8px", fontStyle: "italic" }}>
+                  Checking for similar brand names...
+                </div>
+              )}
             </div>
           )}
 
-          {/* Adding a genuinely new brand is always offered, and is the only
-              thing here that spends credits — it is kept visually separate from
-              the free local suggestions above. */}
           {!addCategoryOpen && (
             <div>
               <button
                 data-testid="add-and-rank"
-                onClick={() => { setAddCategoryOpen(true); researchNewBrand(search.trim()); }}
+                onClick={() => setAddCategoryOpen(true)}
                 style={btnStyle(true)}
               >
                 + Add and rank "{search.trim()}" as new brand
               </button>
-              <div style={{ fontSize: "11px", color: "#81776b", marginTop: "6px", fontStyle: "italic" }}>
-                Looks the brand up to suggest a starting tier. This is the only step that uses AI credits.
-              </div>
             </div>
           )}
 
+          {/* One lightweight step: pick categories, then it goes on the chart. */}
           {addCategoryOpen && (
-            <div data-testid="add-panel" style={{ padding: "12px 14px", border: "1px solid #967342", background: "#fffdfa" }}>
-              <div style={{ fontSize: "14px", color: "#211d17", marginBottom: "2px" }}>{search.trim()}</div>
-              <div style={{ fontSize: "11px", color: "#81776b", fontStyle: "italic", marginBottom: "10px" }}>
-                Not added yet — adjust anything below, then Save.
+            <div data-testid="category-prompt" style={{ padding: "12px 14px", border: "1px solid #967342", background: "#fffdfa" }}>
+              <div style={{ fontSize: "13px", color: "#211d17", marginBottom: "10px" }}>
+                What does <strong>{search.trim()}</strong> sell?
               </div>
-
-              {tierResearching && <div data-testid="researching" style={{ fontSize: "12px", color: "#81776b", marginBottom: "10px" }}>Researching this brand to suggest a tier...</div>}
-              {tierError && <div style={{ fontSize: "12px", color: "#996c6c", marginBottom: "10px" }}>{tierError}</div>}
-
-              {tierSuggestion && (
-                <div style={{ padding: "10px 12px", marginBottom: "12px", background: "#f7f3ed", border: "1px solid #ded6ca" }}>
-                  <div style={{ fontSize: "11px", letterSpacing: "0.1em", color: "#81776b", textTransform: "uppercase", marginBottom: "6px" }}>Suggested tier</div>
-                  <div style={{ fontSize: "12px", color: "#665d53", lineHeight: 1.5 }}>{tierSuggestion.reasoning}</div>
-                  {tierSuggestion.notes && <div style={{ fontSize: "11px", color: "#81776b", fontStyle: "italic", marginTop: "6px", lineHeight: 1.5 }}>{tierSuggestion.notes}</div>}
-                </div>
-              )}
-
-              <div style={{ fontSize: "10px", letterSpacing: "0.12em", color: "#81776b", textTransform: "uppercase", marginBottom: "8px" }}>Tier</div>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginBottom: "14px" }}>
-                {TIER_CONFIG.map((tier) => {
-                  const active = (tierSuggestion?.tier || "F") === tier.label;
-                  return (
-                    <button
-                      key={tier.label}
-                      data-testid={`tier-${tier.label}`}
-                      onClick={() => setTierSuggestion((current) => ({ ...(current || { name: search.trim(), reasoning: "", notes: "", categories: newBrandCategories }), tier: tier.label }))}
-                      title={tier.desc}
-                      style={{ padding: "6px 11px", border: "1px solid " + (active ? tier.color : "#cfc6ba"), background: active ? tier.bg : "#fffdfa", color: active ? tier.color : "#81776b", cursor: "pointer", fontFamily: "inherit", fontSize: "12px", fontWeight: active ? "bold" : "normal" }}
-                    >
-                      {tier.label}
-                    </button>
-                  );
-                })}
-              </div>
-
-              <div style={{ fontSize: "10px", letterSpacing: "0.12em", color: "#81776b", textTransform: "uppercase", marginBottom: "8px" }}>Categories</div>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: "10px", marginBottom: "12px" }}>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: "12px", marginBottom: "12px" }}>
                 {["Clothing", "Shoes", "Handbags", "Accessories"].map((category) => (
-                  <label key={category} style={{ fontSize: "12px", color: "#514b43", cursor: "pointer" }}>
-                    <input type="checkbox" checked={newBrandCategories.includes(category)} onChange={() => setNewBrandCategories((current) => current.includes(category) ? current.filter((item) => item !== category) : [...current, category])} /> {category}
+                  <label key={category} data-testid={`category-${category}`} style={{ fontSize: "12px", color: "#514b43", cursor: "pointer" }}>
+                    <input
+                      type="checkbox"
+                      checked={newBrandCategories.includes(category)}
+                      onChange={() => setNewBrandCategories((current) => current.includes(category) ? current.filter((item) => item !== category) : [...current, category])}
+                    /> {category}
                   </label>
                 ))}
               </div>
-
               <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                 <button
-                  data-testid="save-brand"
-                  disabled={!newBrandCategories.length || tierResearching}
-                  onClick={() => handleAddBrand(search.trim(), newBrandCategories, tierSuggestion?.tier || "F", tierSuggestion?.notes || "")}
+                  data-testid="confirm-add"
+                  disabled={!newBrandCategories.length}
+                  onClick={() => addAndPlaceBrand(search.trim(), newBrandCategories)}
                   style={modalBtnStyle}
                 >
-                  Save brand
+                  Add to chart
                 </button>
-                <button onClick={() => { setAddCategoryOpen(false); setTierSuggestion(null); setTierError(null); }} style={modalBtnStyle}>Cancel</button>
+                <button onClick={() => { setAddCategoryOpen(false); setNewBrandCategories(["Clothing"]); }} style={modalBtnStyle}>Cancel</button>
+              </div>
+              <div style={{ fontSize: "11px", color: "#81776b", marginTop: "8px", fontStyle: "italic" }}>
+                Looks up a starting tier and drops it straight onto the chart — drag it if you disagree.
               </div>
             </div>
           )}
