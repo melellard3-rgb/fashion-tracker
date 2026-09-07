@@ -2,7 +2,23 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- maximum-scale=1 is what makes a pinch spring back to fit-screen on
+         release instead of leaving the page parked at the zoomed level. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover" />
+    <style>
+      /* Belt and braces for the same problem: any element wider than the
+         viewport lets the browser zoom out and strand the layout off-centre. */
+      html, body { max-width: 100%; overflow-x: hidden; overscroll-behavior-x: none; }
+      /* Stop iOS auto-inflating text when the device is turned sideways, which
+         reads as an unexplained zoom. */
+      html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+      /* Inputs under 16px make iOS Safari zoom in on focus and stay there.
+         The fields carry inline font sizes, so this needs !important to win,
+         and it is scoped to phone widths to leave the desktop sizing alone. */
+      @media (max-width: 640px) {
+        input, textarea, select { font-size: 16px !important; }
+      }
+    </style>
     <meta name="theme-color" content="#0d0d0d" />
     <title>Brand Quality Index</title>
   </head>

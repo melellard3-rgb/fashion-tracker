@@ -547,6 +547,16 @@ export default function FashionRankings() {
   const [tierResearching, setTierResearching] = useState(false);
   const [tierError, setTierError] = useState(null);
   const [dismissedSuggestions, setDismissedSuggestions] = useState([]);
+  // The term the currently displayed research belongs to, plus a sequence
+  // number so a slow reply for an earlier term cannot land on a newer one.
+  const researchedTermRef = useRef("");
+  const researchSeqRef = useRef(0);
+  // Extra listing detail typed after a first Check Fit result.
+  const [moreInfo, setMoreInfo] = useState("");
+  // Manual size chart entry.
+  const [manualChartOpen, setManualChartOpen] = useState(false);
+  const [manualRows, setManualRows] = useState([{ size: "", bust: "", waist: "", hips: "" }]);
+  const [manualChartError, setManualChartError] = useState(null);
   const [deletingBrand, setDeletingBrand] = useState(null);
   const [confirmRemoveBrand, setConfirmRemoveBrand] = useState(null);
 
@@ -637,6 +647,19 @@ export default function FashionRankings() {
       });
     return () => { cancelled = true; };
   }, [dirty, brands, ranked, loaded, session, needsSeedChoice, loadError]);
+
+  // Research is tied to the exact text it was run for. Editing the search box
+  // (e.g. "Boss" -> "Hugo Boss") must clear the old brand's description rather
+  // than leave it sitting under a different query.
+  useEffect(() => {
+    if (search.trim() === researchedTermRef.current) return;
+    researchedTermRef.current = "";
+    setTierSuggestion(null);
+    setTierError(null);
+    setTierResearching(false);
+    setAddCategoryOpen(false);
+    setNewBrandCategories(["Clothing"]);
+  }, [search]);
 
   const sendMagicLink = async (event) => {
     event.preventDefault();
@@ -729,15 +752,21 @@ export default function FashionRankings() {
   // Looks the brand up before adding it so it lands on a researched tier rather
   // than defaulting to F. The user can still change the tier before saving.
   const researchNewBrand = async (brandName) => {
+    const term = brandName.trim();
+    const seq = ++researchSeqRef.current;
+    researchedTermRef.current = term;
     setTierResearching(true); setTierError(null); setTierSuggestion(null);
     try {
-      const suggestion = await researchBrandTier(brandName);
-      setTierSuggestion({ name: brandName.trim(), ...suggestion });
+      const suggestion = await researchBrandTier(term);
+      // Drop the reply if the search moved on while it was in flight.
+      if (seq !== researchSeqRef.current || researchedTermRef.current !== term) return;
+      setTierSuggestion({ name: term, ...suggestion });
       setNewBrandCategories(suggestion.categories);
     } catch (error) {
+      if (seq !== researchSeqRef.current || researchedTermRef.current !== term) return;
       setTierError("Couldn't research this brand right now — you can still add it and set the tier yourself.");
     }
-    setTierResearching(false);
+    if (seq === researchSeqRef.current) setTierResearching(false);
   };
 
   const removeBrand = async (brandId) => {
@@ -907,11 +936,63 @@ You MUST answer with the JSON object and nothing else — never ask a clarifying
     setSizeChartLoading(false);
   };
 
+  // Lets the user type a chart straight in — copied off a retailer page, or as
+  // a fallback when the lookup fails or gets it wrong.
+  const saveManualSizeChart = async () => {
+    setManualChartError(null);
+    const rows = manualRows
+      .filter((row) => String(row.size).trim())
+      .map((row) => ({
+        size: String(row.size).trim(),
+        bust: row.bust === "" ? null : Number(row.bust),
+        waist: row.waist === "" ? null : Number(row.waist),
+        hips: row.hips === "" ? null : Number(row.hips),
+      }));
+    if (!rows.length) {
+      setManualChartError("Add at least one row with a size label.");
+      return;
+    }
+    if (rows.some((row) => [row.bust, row.waist, row.hips].some((v) => v !== null && !Number.isFinite(v)))) {
+      setManualChartError("Measurements must be numbers (or left blank).");
+      return;
+    }
+    const chart = {
+      label: "My entry",
+      unit: "in",
+      type: "clothing",
+      estimated: false,
+      source: "manual",
+      sizes: rows,
+      note: "Entered by hand.",
+      fetchedAt: new Date().toISOString(),
+    };
+    try {
+      await appStorage.setSizeCharts(modalBrand.id, [chart]);
+      setSizeCharts([chart]);
+      setSizeChartIndex(0);
+      setSizeChartError(null);
+      setManualChartOpen(false);
+      setManualRows([{ size: "", bust: "", waist: "", hips: "" }]);
+    } catch (error) {
+      setManualChartError("Couldn't save that chart. Try again in a moment.");
+    }
+  };
+
   const runFitCheck = async (brandName, listingText = fitInput) => {
     if (!listingText.trim()) return;
     setFitLoading(true); setFitError(null); setFitResult(null);
     try {
-      const chartText = sizeCharts.length ? JSON.stringify(sizeCharts) : "no size chart available — use general knowledge of this brand's fit if you have it";
+      // Whether a chart was used is decided here, not inferred from the reply,
+      // so the label shown to the user is always accurate.
+      const usedSizeChart = sizeCharts.length > 0;
+      const chartSource = usedSizeChart
+        ? (sizeCharts.some((chart) => chart.source === "manual")
+            ? `${brandName}'s size chart (entered manually)`
+            : sizeCharts.some((chart) => chart.estimated)
+              ? `${brandName}'s size chart (estimated, not official brand data)`
+              : `${brandName}'s size chart`)
+        : null;
+      const chartText = usedSizeChart ? JSON.stringify(sizeCharts) : "no size chart available — use general knowledge of this brand's fit if you have it";
       const prompt = `My saved body measurements: ${JSON.stringify(profile.measurements)}
 
 Brand: ${brandName}
@@ -921,10 +1002,13 @@ Listing details I'm considering (may include a size label and/or garment measure
 """${listingText}"""
 
 Assess whether this listing will fit me. Respond with ONLY raw JSON, no markdown fences, no other text, in exactly this shape:
-{"verdict":"good fit" or "tight" or "loose" or "unclear","recommendedSize":"e.g. size 4 / M","reasoning":"2-3 sentence explanation referencing the actual numbers"}`;
+{"verdict":"good fit" or "tight" or "loose" or "unclear","recommendedSize":"e.g. size 4 / M","reasoning":"2-3 sentence explanation referencing the actual numbers"}
+
+Begin the "reasoning" by saying what you based it on: ${usedSizeChart ? `that you used ${brandName}'s size chart` : `that no size chart was available and you are estimating from general knowledge of this brand`}.`;
       const text = await askClaude(prompt, false);
       const parsed = extractJSON(text);
-      setFitResult(parsed);
+      setFitResult({ ...parsed, usedSizeChart, chartSource });
+      setMoreInfo("");
     } catch (err) {
       setFitError("Couldn't check fit right now. Try again in a moment.");
     }
@@ -1549,10 +1633,46 @@ Respond with ONLY raw JSON, no markdown fences, no other text, in exactly this s
               {fitError && <div style={{ fontSize: "12px", color: "#996c6c", marginTop: "8px" }}>{fitError}</div>}
               {fitResult && (
                 <div style={{ marginTop: "10px", padding: "12px 14px", background: "#f7f3ed", border: "1px solid #ded6ca", borderRadius: "0" }}>
+                  {/* Always say what the recommendation was actually based on. */}
+                  <div data-testid="fit-basis" style={{ fontSize: "11px", color: fitResult.usedSizeChart ? "#71806c" : "#967342", marginBottom: "7px", lineHeight: 1.45 }}>
+                    {fitResult.usedSizeChart
+                      ? `Based on ${fitResult.chartSource}`
+                      : "No size chart on file — estimating from general sizing knowledge"}
+                  </div>
                   <div style={{ fontSize: "13px", fontWeight: "bold", color: fitResult.verdict === "good fit" ? "#71806c" : fitResult.verdict === "unclear" ? "#967342" : "#996c6c", marginBottom: "4px", textTransform: "capitalize" }}>
                     {fitResult.verdict} {fitResult.recommendedSize ? `· Recommend: ${fitResult.recommendedSize}` : ""}
                   </div>
                   <div style={{ fontSize: "12px", color: "#665d53", lineHeight: 1.5 }}>{fitResult.reasoning}</div>
+                </div>
+              )}
+              {/* Add detail and re-run one fresh analysis on the combined text.
+                  Not a conversation — each run is a single new assessment. */}
+              {fitResult && !fitLoading && (
+                <div style={{ marginTop: "10px", padding: "12px 14px", border: "1px dashed #cfc6ba", background: "#fffdfa" }}>
+                  <div style={{ fontSize: "10px", letterSpacing: "0.12em", color: "#81776b", textTransform: "uppercase", marginBottom: "8px" }}>Add more info</div>
+                  <textarea
+                    data-testid="more-info"
+                    value={moreInfo}
+                    onChange={(e) => setMoreInfo(e.target.value)}
+                    placeholder="Anything else? e.g. waist measured 28in flat, fabric has no stretch, seller says runs small"
+                    rows={3}
+                    style={{ ...fieldStyle, resize: "vertical", marginBottom: "8px" }}
+                  />
+                  <button
+                    data-testid="recheck-fit"
+                    disabled={!moreInfo.trim()}
+                    onClick={() => {
+                      const combined = `${fitInput}\n\nAdditional details: ${moreInfo.trim()}`;
+                      setFitInput(combined);
+                      runFitCheck(modalBrand.name, combined);
+                    }}
+                    style={modalBtnStyle}
+                  >
+                    Check fit again with this
+                  </button>
+                  <div style={{ fontSize: "11px", color: "#81776b", marginTop: "6px", fontStyle: "italic" }}>
+                    Re-runs one fresh analysis on everything above plus what you add here.
+                  </div>
                 </div>
               )}
               {fitResult && !saveFitOpen && (
@@ -1598,16 +1718,57 @@ Respond with ONLY raw JSON, no markdown fences, no other text, in exactly this s
             <div style={{ marginBottom: "8px" }}>
               <div style={{ fontSize: "10px", letterSpacing: "0.15em", color: "#81776b", textTransform: "uppercase", marginBottom: "10px" }}>Size Chart</div>
               {sizeChartLoading && <div style={{ fontSize: "12px", color: "#81776b" }}>Looking this up...</div>}
-              {!sizeChartLoading && !sizeCharts.length && !sizeChartError && (
+              {!sizeChartLoading && !sizeCharts.length && !sizeChartError && !manualChartOpen && (
                 <div>
-                  <button onClick={() => fetchSizeChart(modalBrand.name, modalBrand.id, modalBrandCategories)} style={modalBtnStyle}>Get size chart</button>
-                  <div style={{ fontSize: "11px", color: "#81776b", marginTop: "6px", fontStyle: "italic" }}>Looks up {modalBrandIsShoesOnly ? "shoe sizing" : "sizing"} for this brand and saves it.</div>
+                  <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                    <button onClick={() => fetchSizeChart(modalBrand.name, modalBrand.id, modalBrandCategories)} style={modalBtnStyle}>Get size chart</button>
+                    <button data-testid="manual-chart-open" onClick={() => setManualChartOpen(true)} style={modalBtnStyle}>Enter manually</button>
+                  </div>
+                  <div style={{ fontSize: "11px", color: "#81776b", marginTop: "6px", fontStyle: "italic" }}>Looks up {modalBrandIsShoesOnly ? "shoe sizing" : "sizing"} for this brand and saves it — or type your own numbers.</div>
                 </div>
               )}
-              {sizeChartError && !sizeCharts.length && (
-                <div style={{ display: "flex", alignItems: "center", gap: "8px", marginTop: "6px" }}>
-                  <button onClick={() => fetchSizeChart(modalBrand.name, modalBrand.id, modalBrandCategories)} aria-label="Retry size chart" title="Retry size chart" style={iconBtnStyle}>↻</button>
-                  <div style={{ fontSize: "12px", color: "#996c6c" }}>{sizeChartError}</div>
+              {sizeChartError && !sizeCharts.length && !manualChartOpen && (
+                <div style={{ marginTop: "6px" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "8px" }}>
+                    <button onClick={() => fetchSizeChart(modalBrand.name, modalBrand.id, modalBrandCategories)} aria-label="Retry size chart" title="Retry size chart" style={iconBtnStyle}>↻</button>
+                    <div style={{ fontSize: "12px", color: "#996c6c" }}>{sizeChartError}</div>
+                  </div>
+                  <button data-testid="manual-chart-open" onClick={() => setManualChartOpen(true)} style={modalBtnStyle}>Enter manually instead</button>
+                </div>
+              )}
+
+              {manualChartOpen && (
+                <div data-testid="manual-chart-form" style={{ padding: "12px 14px", border: "1px solid #ded6ca", background: "#fffdfa" }}>
+                  <div style={{ fontSize: "10px", letterSpacing: "0.12em", color: "#81776b", textTransform: "uppercase", marginBottom: "10px" }}>Enter a size chart (inches)</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1.1fr 1fr 1fr 1fr auto", gap: "6px", alignItems: "center", marginBottom: "6px", fontSize: "10px", color: "#81776b", textTransform: "uppercase", letterSpacing: "0.08em" }}>
+                    <span>Size</span><span>Bust</span><span>Waist</span><span>Hips</span><span />
+                  </div>
+                  {manualRows.map((row, index) => (
+                    <div key={index} style={{ display: "grid", gridTemplateColumns: "1.1fr 1fr 1fr 1fr auto", gap: "6px", marginBottom: "6px" }}>
+                      {["size", "bust", "waist", "hips"].map((field) => (
+                        <input
+                          key={field}
+                          data-testid={`manual-${field}-${index}`}
+                          value={row[field]}
+                          inputMode={field === "size" ? "text" : "decimal"}
+                          placeholder={field === "size" ? "S" : ""}
+                          onChange={(e) => setManualRows((current) => current.map((r, i) => i === index ? { ...r, [field]: e.target.value } : r))}
+                          style={{ ...fieldStyle, padding: "7px 8px" }}
+                        />
+                      ))}
+                      <button
+                        aria-label={`Remove row ${index + 1}`}
+                        onClick={() => setManualRows((current) => current.length > 1 ? current.filter((_, i) => i !== index) : current)}
+                        style={{ ...modalBtnStyle, padding: "4px 8px" }}
+                      >×</button>
+                    </div>
+                  ))}
+                  <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginTop: "10px" }}>
+                    <button data-testid="manual-add-row" onClick={() => setManualRows((current) => [...current, { size: "", bust: "", waist: "", hips: "" }])} style={modalBtnStyle}>+ Row</button>
+                    <button data-testid="manual-chart-save" onClick={saveManualSizeChart} style={modalBtnStyle}>Save chart</button>
+                    <button onClick={() => { setManualChartOpen(false); setManualChartError(null); }} style={modalBtnStyle}>Cancel</button>
+                  </div>
+                  {manualChartError && <div style={{ fontSize: "11px", color: "#996c6c", marginTop: "8px" }}>{manualChartError}</div>}
                 </div>
               )}
               {sizeCharts.length > 0 && (() => {
@@ -1666,7 +1827,11 @@ Respond with ONLY raw JSON, no markdown fences, no other text, in exactly this s
                       {sizeCharts.map((_, index) => <button key={index} aria-label={`Show chart ${index + 1}`} onClick={() => setSizeChartIndex(index)} style={{ width: "6px", height: "6px", padding: 0, border: "none", borderRadius: "50%", background: index === sizeChartIndex ? "#967342" : "#cfc6ba", cursor: "pointer" }} />)}
                       <button onClick={() => setSizeChartIndex((current) => (current + 1) % sizeCharts.length)} aria-label="Next size chart" style={{ ...modalBtnStyle, padding: "4px 9px", fontSize: "15px", lineHeight: 1 }}>›</button>
                     </div>}
-                    <button onClick={() => fetchSizeChart(modalBrand.name, modalBrand.id, modalBrandCategories)} aria-label="Refresh size chart" title="Refresh size chart" style={{ ...iconBtnStyle, marginTop: "8px" }}>↻</button>
+                    <div style={{ display: "flex", gap: "8px", alignItems: "center", marginTop: "8px", flexWrap: "wrap" }}>
+                      <button onClick={() => fetchSizeChart(modalBrand.name, modalBrand.id, modalBrandCategories)} aria-label="Refresh size chart" title="Refresh size chart" style={iconBtnStyle}>↻</button>
+                      <button data-testid="manual-chart-open" onClick={() => setManualChartOpen(true)} style={modalBtnStyle}>Enter manually</button>
+                      {chart.source === "manual" && <span style={{ fontSize: "11px", color: "#71806c", fontStyle: "italic" }}>Your own numbers</span>}
+                    </div>
                   </div>
                 );
               })()}
