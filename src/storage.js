@@ -116,9 +116,12 @@ export const appStorage = {
       .upsert({ user_id: userId, seeded: true, seed_choice: choice });
     if (error) throw error;
 
-    return choice === "base"
-      ? { brands: defaultBrands, ranked: defaultRanked }
-      : { brands: [], ranked: [] };
+    const ranked = choice === "base" ? defaultRanked : [];
+    return {
+      brands: choice === "base" ? defaultBrands : [],
+      ranked,
+      baseline: snapshotOf(ranked.map((entry) => ({ brand_id: entry.id, tier: entry.tier }))),
+    };
   },
 
   // ---- Brands and rankings -------------------------------------------------
@@ -164,47 +167,90 @@ export const appStorage = {
       ranked.push(...missingRankings.map(({ brand_id, tier }) => ({ id: brand_id, tier })));
     }
 
-    return { brands: normalizedBrands, ranked };
+    // The baseline records what the server held at load time. Every later save
+    // is checked against it, so this tab can only write on top of the state it
+    // actually read.
+    return {
+      brands: normalizedBrands,
+      ranked,
+      baseline: snapshotOf(ranked.map((entry) => ({ brand_id: entry.id, tier: entry.tier }))),
+    };
   },
 
-  async save(brands, ranked) {
+  // Persists a user-made change.
+  //
+  // `baseline` is the ranking snapshot this session last agreed with the server
+  // on (from load(), or from the previous successful save). It is what makes the
+  // write safe:
+  //
+  //   * The server is re-read first and compared against that baseline. If the
+  //     stored tiers have moved since — another tab, another device, a SQL
+  //     restore — this throws STALE_SNAPSHOT and writes nothing. A tab sitting
+  //     on hours-old state can no longer flatten good data.
+  //   * Only rows that actually differ are written, so an unchanged catalog
+  //     costs no writes at all.
+  //   * There is NO delete anywhere. Rankings are only ever upserted, so a
+  //     failure part-way through leaves the table with a mix of old and new
+  //     rows — never empty. Removing a brand deletes the brand, and the
+  //     rankings foreign key cascades that row away on its own.
+  //
+  // Returns the new baseline to carry forward.
+  async save(brands, ranked, baseline = null) {
     const client = requireSupabase();
     const userId = await requireUserId();
 
-    // Nothing at all to persist — usually a failed load. Don't even round-trip.
-    if (!brands.length && !ranked.length) return;
+    if (!brands.length && !ranked.length) return baseline;
 
-    const { error: brandsError } = await client
-      .from("brands")
-      .upsert(brands.map((brand) => ({ ...brand, user_id: userId })));
-    if (brandsError) throw brandsError;
+    // Read the server's current rankings BEFORE touching brands: inserting a
+    // brand fires a trigger that adds an F ranking, and that new row must not
+    // be mistaken for someone else's edit.
+    const { data: currentRows, error: readError } = await client
+      .from("rankings")
+      .select("brand_id, tier, position")
+      .eq("user_id", userId);
+    if (readError) throw readError;
+    const current = new Map((currentRows || []).map((row) => [row.brand_id, { tier: row.tier, position: row.position }]));
 
-    // Nothing to write means nothing to replace. This guard has to sit BEFORE
-    // the delete: an earlier version deleted every ranking row first and only
-    // then returned on an empty `ranked`, so one failed load was enough to wipe
-    // every tier the account had. Brand removal goes through deleteBrand(),
-    // whose foreign key cascades the ranking away, so no legitimate flow needs
-    // the delete-and-bail path.
-    if (!ranked.length) return;
+    const drift = baseline ? describeDrift(baseline, current) : null;
+    if (drift) {
+      const error = new Error(
+        `The saved rankings changed outside this tab (${drift}). This tab's copy is out of date, ` +
+        `so nothing was written. Reload to pick up the current rankings.`
+      );
+      error.code = "STALE_SNAPSHOT";
+      throw error;
+    }
 
-    // Replace this user's rankings only — never touch anyone else's rows.
-    const { error: deleteError } = await client.from("rankings").delete().eq("user_id", userId);
-    if (deleteError) throw deleteError;
+    if (brands.length) {
+      const { error: brandsError } = await client
+        .from("brands")
+        .upsert(brands.map((brand) => ({ ...brand, user_id: userId })));
+      if (brandsError) throw brandsError;
+    }
 
-    const rankedIds = new Set(ranked.map((entry) => entry.id));
-    const completeRanked = [
-      ...ranked,
-      ...brands
-        .filter((brand) => !rankedIds.has(brand.id))
-        .map((brand) => ({ id: brand.id, tier: "F" })),
-    ];
-    const { error } = await client.from("rankings").upsert(completeRanked.map((entry, position) => ({
-      user_id: userId,
-      brand_id: entry.id,
-      tier: entry.tier,
-      position,
-    })));
-    if (error) throw error;
+    // Only ever write the rankings actually held in memory. This function must
+    // never invent a tier: an earlier version filled in "F" for every brand
+    // that had no in-memory ranking, which meant one empty `ranked` list
+    // flattened the whole catalog to F. A brand with no ranking already gets an
+    // F row from the database trigger on insert, and load() backfills any gap,
+    // so there is nothing here to make up.
+    if (!ranked.length) return baseline;
+
+    const desired = ranked.map((entry, position) => ({ brand_id: entry.id, tier: entry.tier, position }));
+
+    const changed = desired.filter((row) => {
+      const existing = current.get(row.brand_id);
+      return !existing || existing.tier !== row.tier || existing.position !== row.position;
+    });
+
+    if (changed.length) {
+      const { error } = await client
+        .from("rankings")
+        .upsert(changed.map((row) => ({ ...row, user_id: userId })));
+      if (error) throw error;
+    }
+
+    return snapshotOf(desired);
   },
 
   // Fully removes a brand from this user's list. Rankings, size charts, and
@@ -381,6 +427,27 @@ export const appStorage = {
     if (error) throw error;
   },
 };
+
+// A baseline is brand_id -> tier. Position is deliberately excluded: it gets
+// renumbered on every reorder and drifting positions are harmless, whereas a
+// changed tier is exactly what must never be silently overwritten.
+function snapshotOf(rows) {
+  return new Map(rows.map((row) => [row.brand_id ?? row.id, row.tier]));
+}
+
+// Returns a short description of how the server diverged from the baseline, or
+// null when they agree.
+function describeDrift(baseline, current) {
+  if (baseline.size !== current.size) {
+    return `${baseline.size} rankings when loaded, ${current.size} now`;
+  }
+  for (const [brandId, tier] of baseline) {
+    const now = current.get(brandId);
+    if (!now) return `ranking for brand ${brandId} no longer exists`;
+    if (now.tier !== tier) return `brand ${brandId} is ${now.tier} on the server, ${tier} in this tab`;
+  }
+  return null;
+}
 
 // The bucket is private, so a stored path has to be exchanged for a temporary
 // signed URL. Legacy rows that still hold a public photo_url keep working.

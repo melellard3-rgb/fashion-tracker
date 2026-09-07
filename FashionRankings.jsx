@@ -531,6 +531,13 @@ export default function FashionRankings() {
   const [authError, setAuthError] = useState(null);
   const [setupChecked, setSetupChecked] = useState(false);
   const [loadError, setLoadError] = useState(null);
+  // The app must never push state it merely loaded. `dirty` is set only by an
+  // actual user edit, and the save effect does nothing until it is true — a tab
+  // that just opens, or sits idle, writes nothing at all.
+  const [dirty, setDirty] = useState(false);
+  const [saveConflict, setSaveConflict] = useState(null);
+  // What the server held when this tab last agreed with it. Guards every write.
+  const baselineRef = useRef(null);
   const [needsSeedChoice, setNeedsSeedChoice] = useState(false);
   const [seeding, setSeeding] = useState(false);
   const [seedError, setSeedError] = useState(null);
@@ -578,9 +585,11 @@ export default function FashionRankings() {
         const saved = await appStorage.load();
         const savedProfile = await appStorage.getProfile();
         if (cancelled) return;
+        baselineRef.current = saved.baseline;
         setBrands(saved.brands);
         setRanked(saved.ranked);
         setProfile(savedProfile);
+        setDirty(false);
         nextId.current = saved.brands.reduce((m, b) => Math.max(m, b.id), 0) + 1;
         try {
           const fits = await appStorage.getSavedFits();
@@ -604,11 +613,30 @@ export default function FashionRankings() {
   }, [session]);
 
   useEffect(() => {
-    if (!loaded || !session || needsSeedChoice || loadError) return;
-    appStorage.save(brands, ranked).catch((error) => {
-      console.error("Could not save Fashion Tracker data", error);
-    });
-  }, [brands, ranked, loaded, session, needsSeedChoice, loadError]);
+    // `dirty` is the whole point: without it this effect ran on mount and wrote
+    // the just-loaded snapshot straight back, which is how a stale tab erased
+    // good rankings.
+    if (!dirty || !loaded || !session || needsSeedChoice || loadError) return;
+    let cancelled = false;
+    appStorage.save(brands, ranked, baselineRef.current)
+      .then((nextBaseline) => {
+        if (cancelled) return;
+        if (nextBaseline) baselineRef.current = nextBaseline;
+        setDirty(false);
+        setSaveConflict(null);
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        console.error("Could not save Fashion Tracker data", error);
+        // A stale tab is not a transient failure: stop retrying and tell the
+        // user, rather than looping against a server that has newer data.
+        if (error?.code === "STALE_SNAPSHOT") {
+          setDirty(false);
+          setSaveConflict(error.message);
+        }
+      });
+    return () => { cancelled = true; };
+  }, [dirty, brands, ranked, loaded, session, needsSeedChoice, loadError]);
 
   const sendMagicLink = async (event) => {
     event.preventDefault();
@@ -628,6 +656,8 @@ export default function FashionRankings() {
     try {
       const seeded = await appStorage.seedCatalog(choice, categorizedBrands, initialRanked);
       const savedProfile = await appStorage.getProfile();
+      baselineRef.current = seeded.baseline;
+      setDirty(false);
       setBrands(seeded.brands);
       setRanked(seeded.ranked);
       setProfile(savedProfile);
@@ -650,6 +680,7 @@ export default function FashionRankings() {
     const id = dragItem.current;
     if (!id) return;
     setRanked((prev) => [...prev.filter((r) => r.id !== id), { id, tier }]);
+    setDirty(true);
     setDragOver(null);
   };
 
@@ -657,6 +688,7 @@ export default function FashionRankings() {
     e.preventDefault(); e.stopPropagation();
     const id = dragItem.current;
     if (!id || id === targetId) return;
+    setDirty(true);
     if (dragSource.current === "tier-" + tier) {
       setRanked((prev) => {
         const items = prev.filter((r) => r.tier === tier);
@@ -685,6 +717,7 @@ export default function FashionRankings() {
     const newId = nextId.current++;
     setBrands((prev) => [...prev, { id: newId, name, notes, categories }]);
     setRanked((prev) => [...prev, { id: newId, tier }]);
+    setDirty(true);
     setNewestId(newId);
     setAddCategoryOpen(false);
     setNewBrandCategories(["Clothing"]);
@@ -713,6 +746,9 @@ export default function FashionRankings() {
       await appStorage.deleteBrand(brandId);
       setBrands((prev) => prev.filter((brand) => brand.id !== brandId));
       setRanked((prev) => prev.filter((entry) => entry.id !== brandId));
+      // The row is already gone server-side (deleted brand, cascaded ranking),
+      // so drop it from the baseline too rather than flagging a change to save.
+      if (baselineRef.current) baselineRef.current.delete(brandId);
       setModalBrandId(null);
     } catch (error) {
       console.error("Could not remove brand", error);
@@ -1265,6 +1301,15 @@ Respond with ONLY raw JSON, no markdown fences, no other text, in exactly this s
           </div>
         </div>
       </div>
+
+      {saveConflict && (
+        <div style={{ marginBottom: "14px", padding: "12px 14px", border: "1px solid #c9aead", background: "#fbf9f5" }}>
+          <div style={{ fontSize: "12px", color: "#996c6c", marginBottom: "8px", lineHeight: 1.5 }}>
+            <strong>Your change wasn't saved.</strong> {saveConflict}
+          </div>
+          <button onClick={() => window.location.reload()} style={modalBtnStyle}>Reload</button>
+        </div>
+      )}
 
       <input
         value={search}
