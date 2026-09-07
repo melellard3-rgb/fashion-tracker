@@ -2,9 +2,14 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <!-- maximum-scale=1 is what makes a pinch spring back to fit-screen on
-         release instead of leaving the page parked at the zoomed level. -->
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover" />
+    <!-- No maximum-scale / user-scalable here, deliberately.
+         iOS Safari has ignored user-scalable, minimum-scale and maximum-scale
+         since iOS 10 (webkit.org/blog/7367), on purpose, so a page can never
+         trap a user at an unreadable size. Setting maximum-scale=1 therefore
+         does NOTHING on iPhone — but Chrome on Android *does* honour it, so
+         keeping it only removes zoom for Android users while fixing nothing on
+         iOS. The real causes of unexpected zoom are handled in CSS below. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <style>
       /* Belt and braces for the same problem: any element wider than the
          viewport lets the browser zoom out and strand the layout off-centre. */
