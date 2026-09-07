@@ -1,64 +1,82 @@
+-- BQI Fashion Tracker — multi-user schema, RLS, and one-time migration.
+--
+-- Safe to run repeatedly. Run it once now; if your auth user does not exist yet
+-- (you have not completed a magic-link login), the migration block at the end
+-- reports a notice and does nothing. After your first login, run
+--   select public.claim_legacy_bqi_data('melellard3@gmail.com');
+-- to attach all pre-existing data to your account.
+
+-- ---------------------------------------------------------------------------
+-- 0. Preflight guard
+--
+-- Step 4 assigns every pre-existing row to an account, and anything still
+-- unowned afterwards is deleted (an unowned row is invisible under RLS, so it
+-- can only be dead weight). If the account does not exist yet, that delete
+-- would take the whole existing catalog with it. Refuse to start in that case,
+-- before any schema change has been made.
+-- ---------------------------------------------------------------------------
+
+do $$
+declare
+  legacy_count integer := 0;
+  target_id uuid;
+begin
+  if to_regclass('public.brands') is not null then
+    if exists (
+      select 1 from information_schema.columns
+      where table_schema = 'public' and table_name = 'brands' and column_name = 'user_id'
+    ) then
+      execute 'select count(*) from public.brands where user_id is null' into legacy_count;
+    else
+      execute 'select count(*) from public.brands' into legacy_count;
+    end if;
+  end if;
+
+  select id into target_id from auth.users where lower(email) = lower('melellard3@gmail.com') limit 1;
+
+  if legacy_count > 0 and target_id is null then
+    raise exception
+      'BQI migration stopped: found % pre-existing brands but no auth user for melellard3@gmail.com. Sign in once with the magic link, then re-run this script so that data is migrated to your account instead of dropped.',
+      legacy_count;
+  end if;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 1. Base tables (created if this is a fresh project)
+-- ---------------------------------------------------------------------------
+
 create table if not exists public.brands (
-  id integer primary key,
+  id integer not null,
   name text not null,
   notes text not null default '',
   categories text[] not null default array['Clothing']::text[]
 );
 
-alter table public.brands add column if not exists categories text[] not null default array['Clothing']::text[];
-update public.brands set categories = array['Clothing']::text[] where categories is null or cardinality(categories) = 0;
-update public.brands set categories = array['Clothing', 'Shoes']::text[] where name in ('Steve Madden', 'Vince Camuto', 'Gianni Bini');
-update public.brands set categories = array['Clothing', 'Handbags', 'Accessories']::text[] where name in ('Fendi', 'Pinko');
-update public.brands set categories = array['Clothing', 'Accessories']::text[] where name in ('Calvin Klein', 'Ted Baker', 'Red Carter');
-
 create table if not exists public.rankings (
-  brand_id integer primary key references public.brands(id) on delete cascade,
+  brand_id integer not null,
   tier text not null check (tier in ('S', 'A', 'B', 'C', 'D', 'F')),
   position integer not null
 );
 
-create or replace function public.ensure_brand_ranking()
-returns trigger
-language plpgsql
-security definer
-set search_path = public
-as $$
-begin
-  insert into public.rankings (brand_id, tier, position)
-  select new.id, 'F', coalesce(max(position), -1) + 1
-  from public.rankings
-  where not exists (
-    select 1 from public.rankings where brand_id = new.id
-  );
-  return new;
-end;
-$$;
-
-drop trigger if exists ensure_brand_ranking_on_insert on public.brands;
-create trigger ensure_brand_ranking_on_insert
-  after insert on public.brands
-  for each row execute function public.ensure_brand_ranking();
-
 create table if not exists public.size_charts (
-  brand_id integer primary key references public.brands(id) on delete cascade,
+  brand_id integer not null,
   data jsonb not null,
   updated_at timestamptz not null default now()
 );
 
 create table if not exists public.price_guides (
-  brand_id integer primary key references public.brands(id) on delete cascade,
+  brand_id integer not null,
   data jsonb not null,
   updated_at timestamptz not null default now()
 );
 
 create table if not exists public.profile (
-  id integer primary key check (id = 1),
+  id integer,
   name text not null default '',
   measurements jsonb not null default '{}'::jsonb,
   updated_at timestamptz not null default now()
 );
-
-update public.profile set name = 'Mel' where id = 1 and (name is null or name = '');
 
 create table if not exists public.saved_fits (
   id uuid primary key default gen_random_uuid(),
@@ -69,26 +87,214 @@ create table if not exists public.saved_fits (
   size text,
   material text,
   fit_verdict text not null,
-  confirmed_fit text not null default 'Not yet confirmed' check (confirmed_fit in ('Not yet confirmed', 'Fits', 'Doesn''t fit')),
+  confirmed_fit text not null default 'Not yet confirmed',
   fit_reasoning text,
   original_text text not null,
   saved_at timestamptz not null default now()
 );
 
-alter table public.saved_fits add column if not exists confirmed_fit text not null default 'Not yet confirmed';
-update public.saved_fits set confirmed_fit = 'Not yet confirmed' where confirmed_fit is null or confirmed_fit not in ('Not yet confirmed', 'Fits', 'Doesn''t fit');
+-- ---------------------------------------------------------------------------
+-- 2. Add user ownership to every table
+-- ---------------------------------------------------------------------------
 
-insert into storage.buckets (id, name, public)
-values ('fit-photos', 'fit-photos', true)
-on conflict (id) do update set public = true;
+alter table public.brands       add column if not exists user_id uuid references auth.users(id) on delete cascade;
+alter table public.rankings     add column if not exists user_id uuid references auth.users(id) on delete cascade;
+alter table public.size_charts  add column if not exists user_id uuid references auth.users(id) on delete cascade;
+alter table public.price_guides add column if not exists user_id uuid references auth.users(id) on delete cascade;
+alter table public.profile      add column if not exists user_id uuid references auth.users(id) on delete cascade;
+alter table public.saved_fits   add column if not exists user_id uuid references auth.users(id) on delete cascade;
 
-alter table public.brands enable row level security;
-alter table public.rankings enable row level security;
-alter table public.size_charts enable row level security;
+-- Private storage path for a fit photo. photo_url is kept for legacy rows that
+-- still hold a public URL from before the bucket became private.
+alter table public.saved_fits add column if not exists photo_path text;
+
+alter table public.saved_fits
+  drop constraint if exists saved_fits_confirmed_fit_check;
+alter table public.saved_fits
+  add constraint saved_fits_confirmed_fit_check
+  check (confirmed_fit in ('Not yet confirmed', 'Fits', 'Doesn''t fit'));
+
+update public.saved_fits
+  set confirmed_fit = 'Not yet confirmed'
+  where confirmed_fit is null or confirmed_fit not in ('Not yet confirmed', 'Fits', 'Doesn''t fit');
+
+-- A per-user tracker for onboarding: whether the user has picked a starting
+-- catalog yet ("base list" vs "blank").
+create table if not exists public.user_setup (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  seeded boolean not null default false,
+  seed_choice text check (seed_choice in ('base', 'blank')),
+  created_at timestamptz not null default now()
+);
+
+-- ---------------------------------------------------------------------------
+-- 3. Re-key everything on (user_id, ...) so brand ids are per-user
+-- ---------------------------------------------------------------------------
+
+-- Drop the old single-tenant keys/foreign keys before rebuilding them.
+alter table public.rankings     drop constraint if exists rankings_brand_id_fkey;
+alter table public.size_charts  drop constraint if exists size_charts_brand_id_fkey;
+alter table public.price_guides drop constraint if exists price_guides_brand_id_fkey;
+
+alter table public.brands       drop constraint if exists brands_pkey       cascade;
+alter table public.rankings     drop constraint if exists rankings_pkey     cascade;
+alter table public.size_charts  drop constraint if exists size_charts_pkey  cascade;
+alter table public.price_guides drop constraint if exists price_guides_pkey cascade;
+alter table public.profile      drop constraint if exists profile_pkey      cascade;
+
+-- The legacy profile table had a `check (id = 1)` single-row guard and an id
+-- column; ownership is now the primary key, so drop both.
+alter table public.profile drop constraint if exists profile_id_check;
+alter table public.profile drop column if exists id;
+
+-- ---------------------------------------------------------------------------
+-- 4. One-time migration: claim all pre-existing rows for an account
+-- ---------------------------------------------------------------------------
+
+create or replace function public.claim_legacy_bqi_data(target_email text)
+returns text
+language plpgsql
+security definer
+set search_path = public, auth
+as $$
+declare
+  target_id uuid;
+  claimed integer := 0;
+begin
+  select id into target_id from auth.users where lower(email) = lower(target_email) limit 1;
+  if target_id is null then
+    return format('No auth user for %s yet — log in once with the magic link, then re-run this function.', target_email);
+  end if;
+
+  update public.brands       set user_id = target_id where user_id is null;
+  get diagnostics claimed = row_count;
+
+  update public.rankings     set user_id = target_id where user_id is null;
+  update public.size_charts  set user_id = target_id where user_id is null;
+  update public.price_guides set user_id = target_id where user_id is null;
+  update public.profile      set user_id = target_id where user_id is null;
+  update public.saved_fits   set user_id = target_id where user_id is null;
+
+  -- An account that already owns brands has completed onboarding.
+  insert into public.user_setup (user_id, seeded, seed_choice)
+  values (target_id, true, 'base')
+  on conflict (user_id) do update set seeded = true;
+
+  return format('Claimed legacy data for %s (%s brands).', target_email, claimed);
+end;
+$$;
+
+do $$
+declare
+  result text;
+begin
+  select public.claim_legacy_bqi_data('melellard3@gmail.com') into result;
+  raise notice '%', result;
+end;
+$$;
+
+-- Any row still unowned after the claim cannot be exposed under RLS, so drop it
+-- rather than leave invisible orphans behind.
+delete from public.rankings     where user_id is null;
+delete from public.size_charts  where user_id is null;
+delete from public.price_guides where user_id is null;
+delete from public.profile      where user_id is null;
+delete from public.saved_fits   where user_id is null;
+delete from public.brands       where user_id is null;
+
+-- ---------------------------------------------------------------------------
+-- 5. Enforce ownership and rebuild keys
+-- ---------------------------------------------------------------------------
+
+alter table public.brands       alter column user_id set not null;
+alter table public.rankings     alter column user_id set not null;
+alter table public.size_charts  alter column user_id set not null;
+alter table public.price_guides alter column user_id set not null;
+alter table public.profile      alter column user_id set not null;
+alter table public.saved_fits   alter column user_id set not null;
+
+alter table public.brands       add primary key (user_id, id);
+alter table public.rankings     add primary key (user_id, brand_id);
+alter table public.size_charts  add primary key (user_id, brand_id);
+alter table public.price_guides add primary key (user_id, brand_id);
+alter table public.profile      add primary key (user_id);
+
+-- Deleting a brand now cascades to its ranking, size chart, and price guide,
+-- which is what the "remove this brand entirely" action relies on.
+-- Dropped by name first so the whole script stays re-runnable.
+alter table public.rankings     drop constraint if exists rankings_brand_fkey;
+alter table public.size_charts  drop constraint if exists size_charts_brand_fkey;
+alter table public.price_guides drop constraint if exists price_guides_brand_fkey;
+
+alter table public.rankings
+  add constraint rankings_brand_fkey
+  foreign key (user_id, brand_id) references public.brands(user_id, id) on delete cascade;
+alter table public.size_charts
+  add constraint size_charts_brand_fkey
+  foreign key (user_id, brand_id) references public.brands(user_id, id) on delete cascade;
+alter table public.price_guides
+  add constraint price_guides_brand_fkey
+  foreign key (user_id, brand_id) references public.brands(user_id, id) on delete cascade;
+
+create index if not exists brands_user_idx      on public.brands(user_id);
+create index if not exists rankings_user_idx    on public.rankings(user_id);
+create index if not exists saved_fits_user_idx  on public.saved_fits(user_id, saved_at desc);
+
+-- New brands still get an F-tier ranking by default at the database level; the
+-- app overrides this with a researched tier when it has one.
+create or replace function public.ensure_brand_ranking()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  insert into public.rankings (user_id, brand_id, tier, position)
+  select new.user_id, new.id, 'F', coalesce(max(position), -1) + 1
+  from public.rankings
+  where user_id = new.user_id
+  on conflict (user_id, brand_id) do nothing;
+  return new;
+end;
+$$;
+
+drop trigger if exists ensure_brand_ranking_on_insert on public.brands;
+create trigger ensure_brand_ranking_on_insert
+  after insert on public.brands
+  for each row execute function public.ensure_brand_ranking();
+
+-- Give every new signup a setup row so the app can show the onboarding choice.
+create or replace function public.handle_new_bqi_user()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  insert into public.user_setup (user_id) values (new.id)
+  on conflict (user_id) do nothing;
+  return new;
+end;
+$$;
+
+drop trigger if exists on_auth_user_created_bqi on auth.users;
+create trigger on_auth_user_created_bqi
+  after insert on auth.users
+  for each row execute function public.handle_new_bqi_user();
+
+-- ---------------------------------------------------------------------------
+-- 6. Row Level Security — each user sees only their own rows
+-- ---------------------------------------------------------------------------
+
+alter table public.brands       enable row level security;
+alter table public.rankings     enable row level security;
+alter table public.size_charts  enable row level security;
 alter table public.price_guides enable row level security;
-alter table public.profile enable row level security;
-alter table public.saved_fits enable row level security;
+alter table public.profile      enable row level security;
+alter table public.saved_fits   enable row level security;
+alter table public.user_setup   enable row level security;
 
+-- Remove the old anonymous-access policies.
 drop policy if exists "Allow public brand reads" on public.brands;
 drop policy if exists "Allow public brand writes" on public.brands;
 drop policy if exists "Allow public ranking reads" on public.rankings;
@@ -105,39 +311,39 @@ drop policy if exists "Allow public fit photo reads" on storage.objects;
 drop policy if exists "Allow public fit photo uploads" on storage.objects;
 drop policy if exists "Allow public fit photo deletes" on storage.objects;
 
-create policy "Allow public brand reads"
-  on public.brands for select to anon using (true);
-create policy "Allow public brand writes"
-  on public.brands for all to anon using (true) with check (true);
+do $$
+declare
+  target text;
+begin
+  foreach target in array array['brands', 'rankings', 'size_charts', 'price_guides', 'profile', 'saved_fits', 'user_setup']
+  loop
+    execute format('drop policy if exists %I on public.%I', target || '_owner_rw', target);
+    execute format(
+      'create policy %I on public.%I for all to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid())',
+      target || '_owner_rw', target
+    );
+  end loop;
+end;
+$$;
 
-create policy "Allow public ranking reads"
-  on public.rankings for select to anon using (true);
-create policy "Allow public ranking writes"
-  on public.rankings for all to anon using (true) with check (true);
+-- ---------------------------------------------------------------------------
+-- 7. Fit photo storage — private bucket, one folder per user
+-- ---------------------------------------------------------------------------
 
-create policy "Allow public size chart reads"
-  on public.size_charts for select to anon using (true);
-create policy "Allow public size chart writes"
-  on public.size_charts for all to anon using (true) with check (true);
+insert into storage.buckets (id, name, public)
+values ('fit-photos', 'fit-photos', false)
+on conflict (id) do update set public = false;
 
-create policy "Allow public price guide reads"
-  on public.price_guides for select to anon using (true);
-create policy "Allow public price guide writes"
-  on public.price_guides for all to anon using (true) with check (true);
+drop policy if exists "Owner fit photo reads" on storage.objects;
+drop policy if exists "Owner fit photo uploads" on storage.objects;
+drop policy if exists "Owner fit photo updates" on storage.objects;
+drop policy if exists "Owner fit photo deletes" on storage.objects;
 
-create policy "Allow public profile reads"
-  on public.profile for select to anon using (true);
-create policy "Allow public profile writes"
-  on public.profile for all to anon using (true) with check (true);
-
-create policy "Allow public saved fit reads"
-  on public.saved_fits for select to anon using (true);
-create policy "Allow public saved fit writes"
-  on public.saved_fits for all to anon using (true) with check (true);
-
-create policy "Allow public fit photo reads"
-  on storage.objects for select to anon using (bucket_id = 'fit-photos');
-create policy "Allow public fit photo uploads"
-  on storage.objects for insert to anon with check (bucket_id = 'fit-photos');
-create policy "Allow public fit photo deletes"
-  on storage.objects for delete to anon using (bucket_id = 'fit-photos');
+create policy "Owner fit photo reads" on storage.objects for select to authenticated
+  using (bucket_id = 'fit-photos' and (storage.foldername(name))[1] = auth.uid()::text);
+create policy "Owner fit photo uploads" on storage.objects for insert to authenticated
+  with check (bucket_id = 'fit-photos' and (storage.foldername(name))[1] = auth.uid()::text);
+create policy "Owner fit photo updates" on storage.objects for update to authenticated
+  using (bucket_id = 'fit-photos' and (storage.foldername(name))[1] = auth.uid()::text);
+create policy "Owner fit photo deletes" on storage.objects for delete to authenticated
+  using (bucket_id = 'fit-photos' and (storage.foldername(name))[1] = auth.uid()::text);

@@ -8,7 +8,21 @@ const port = Number(process.env.PORT || 8787);
 const projectRoot = path.dirname(fileURLToPath(import.meta.url));
 const distPath = path.join(projectRoot, "..", "dist");
 
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "8mb" }));
+
+// express.json() rejects oversized/malformed bodies by throwing, and Express's
+// default handler answers with an HTML error page. The client always does
+// res.json(), so return JSON here instead of letting it choke on markup.
+app.use((error, req, res, next) => {
+  if (!error) return next();
+  const status = error.status || error.statusCode || 400;
+  return res.status(status).json({
+    error: error.type === "entity.too.large"
+      ? "That request was too large to process."
+      : "The request body could not be read.",
+    detail: error.message,
+  });
+});
 
 app.post("/api/claude", async (req, res) => {
   if (!process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY === "your-anthropic-api-key") {
@@ -64,17 +78,27 @@ app.post("/api/poshmark-listing", async (req, res) => {
     if (!response.ok) return res.status(502).json({ error: "Poshmark did not return this listing." });
     const html = await response.text();
     const meta = (property) => {
-      const match = html.match(new RegExp(`<meta[^>]+(?:property|name)=["']${property}["'][^>]+content=["']([^"']*)["']`, "i"));
-      return match ? decodeHtml(match[1]) : "";
+      // Attribute order varies between templates, so try both arrangements.
+      const patterns = [
+        `<meta[^>]+(?:property|name)=["']${property}["'][^>]*\\scontent=["']([^"']*)["']`,
+        `<meta[^>]+content=["']([^"']*)["'][^>]*\\s(?:property|name)=["']${property}["']`,
+      ];
+      for (const pattern of patterns) {
+        const match = html.match(new RegExp(pattern, "i"));
+        if (match) return decodeHtml(match[1]);
+      }
+      return "";
     };
-    const jsonLd = [...html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)]
-      .map((match) => { try { return JSON.parse(match[1]); } catch { return null; } })
-      .find(Boolean) || {};
-    const title = sanitizeListingText(jsonLd.name || meta("og:title") || meta("twitter:title") || "");
-    const description = sanitizeListingText(jsonLd.description || meta("og:description") || meta("description") || "");
-    const imageUrl = jsonLd.image?.url || jsonLd.image || meta("og:image") || meta("twitter:image") || "";
+    // Poshmark emits several ld+json blocks and the Product one is not first —
+    // the BreadcrumbList usually is. Taking the first parseable block loses the
+    // real listing description (the part carrying the seller's measurements).
+    const product = findProductNode(html);
+    const title = sanitizeListingText(product.name || meta("og:title") || meta("twitter:title") || "");
+    const description = sanitizeListingText(product.description || meta("og:description") || meta("description") || "");
+    // `image` may be a string, an ImageObject, or an array of either.
+    const imageUrl = pickImageUrl(product.image) || meta("og:image") || meta("twitter:image") || "";
     const image = imageUrl ? await fetchImageDataUrl(imageUrl) : null;
-    return res.json({ title, description, image });
+    return res.json({ title, description, image, imageUrl: imageUrl || null });
   } catch (error) {
     return res.status(502).json({ error: "Could not fetch this Poshmark listing.", detail: error.message });
   }
@@ -89,6 +113,47 @@ app.get(/.*/, (req, res) => {
 app.listen(port, () => {
   console.log(`API server running at http://localhost:${port}`);
 });
+
+// Flattens every ld+json block (including @graph containers) and returns the
+// Product node, which is where the seller's real description lives.
+function findProductNode(html) {
+  const nodes = [];
+  for (const match of html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
+    let parsed;
+    try {
+      parsed = JSON.parse(match[1]);
+    } catch {
+      continue;
+    }
+    const stack = [parsed];
+    while (stack.length) {
+      const node = stack.pop();
+      if (Array.isArray(node)) { stack.push(...node); continue; }
+      if (!node || typeof node !== "object") continue;
+      nodes.push(node);
+      if (Array.isArray(node["@graph"])) stack.push(...node["@graph"]);
+    }
+  }
+  const isProduct = (node) => {
+    const type = node["@type"];
+    return type === "Product" || (Array.isArray(type) && type.includes("Product"));
+  };
+  return nodes.find(isProduct) || nodes.find((node) => node.name && node.description) || {};
+}
+
+function pickImageUrl(value) {
+  if (!value) return "";
+  if (typeof value === "string") return value.trim();
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const url = pickImageUrl(entry);
+      if (url) return url;
+    }
+    return "";
+  }
+  if (typeof value === "object") return pickImageUrl(value.url || value.contentUrl || "");
+  return "";
+}
 
 function decodeHtml(value) {
   return value
@@ -113,12 +178,26 @@ function sanitizeListingText(value) {
 
 async function fetchImageDataUrl(imageUrl) {
   try {
-    const response = await fetch(imageUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
+    const response = await fetch(imageUrl, {
+      headers: { "User-Agent": "Mozilla/5.0", Referer: "https://poshmark.com/" },
+    });
+    if (!response.ok) {
+      console.error("Listing image fetch failed", { imageUrl, status: response.status });
+      return null;
+    }
     const contentType = response.headers.get("content-type") || "image/jpeg";
+    if (!contentType.startsWith("image/")) {
+      console.error("Listing image was not an image", { imageUrl, contentType });
+      return null;
+    }
     const bytes = await response.arrayBuffer();
-    if (bytes.byteLength > 8 * 1024 * 1024) return null;
+    if (bytes.byteLength > 6 * 1024 * 1024) {
+      console.error("Listing image too large", { imageUrl, bytes: bytes.byteLength });
+      return null;
+    }
     return `data:${contentType};base64,${Buffer.from(bytes).toString("base64")}`;
-  } catch {
+  } catch (error) {
+    console.error("Listing image fetch threw", { imageUrl, message: error.message });
     return null;
   }
 }
