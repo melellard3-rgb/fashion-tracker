@@ -2,6 +2,7 @@ import "dotenv/config";
 import express from "express";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { BROWSER_UA, isPoshmarkHost, isShareLinkHost, resolveListing } from "./poshmark-url.js";
 
 const app = express();
 const port = Number(process.env.PORT || 8787);
@@ -67,37 +68,14 @@ app.post("/api/poshmark-listing", async (req, res) => {
     return res.status(400).json({ error: "Enter a valid Poshmark listing URL." });
   }
 
-  // posh.mk is Poshmark's share-link shortener. Accept it as an entry point and
-  // let fetch follow the redirect, rather than making the user expand it first.
-  const isListingHost = (host) => /(^|\.)poshmark\.[a-z.]+$/i.test(host);
-  const isShortHost = (host) => /(^|\.)posh\.mk$/i.test(host);
-  if (!isListingHost(listingUrl.hostname) && !isShortHost(listingUrl.hostname)) {
+  if (!isPoshmarkHost(listingUrl.hostname) && !isShareLinkHost(listingUrl.hostname)) {
     return res.status(400).json({ error: "Only Poshmark listing URLs (poshmark.com or posh.mk) are supported." });
   }
 
   try {
-    const response = await fetch(listingUrl, {
-      redirect: "follow",
-      headers: { "User-Agent": "Mozilla/5.0 (compatible; BQI listing importer)" },
-    });
-    if (!response.ok) return res.status(502).json({ error: "Poshmark did not return this listing." });
-
-    // A shortener can redirect anywhere, so the destination is re-checked
-    // rather than trusted: only a real Poshmark page is parsed.
-    let finalUrl = listingUrl;
-    try {
-      finalUrl = new URL(response.url || String(listingUrl));
-    } catch { /* keep the original */ }
-    // A dead or mistyped share link redirects to the Poshmark homepage, which
-    // would otherwise be scraped and returned as if it were a listing. Require
-    // the destination to actually be a listing page.
-    if (!isListingHost(finalUrl.hostname) || !/\/listing\//i.test(finalUrl.pathname)) {
-      return res.status(400).json({
-        error: "That link didn't resolve to a Poshmark listing — check the link and try again.",
-      });
-    }
-
-    const html = await response.text();
+    const resolved = await resolveListing(listingUrl);
+    if (resolved.error) return res.status(resolved.status || 400).json({ error: resolved.error });
+    const html = resolved.html;
     const meta = (property) => {
       // Attribute order varies between templates, so try both arrangements.
       const patterns = [
@@ -200,7 +178,7 @@ function sanitizeListingText(value) {
 async function fetchImageDataUrl(imageUrl) {
   try {
     const response = await fetch(imageUrl, {
-      headers: { "User-Agent": "Mozilla/5.0", Referer: "https://poshmark.com/" },
+      headers: { "User-Agent": BROWSER_UA, Referer: "https://poshmark.com/" },
     });
     if (!response.ok) {
       console.error("Listing image fetch failed", { imageUrl, status: response.status });
