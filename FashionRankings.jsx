@@ -1284,6 +1284,18 @@ Respond with ONLY raw JSON, no markdown fences, no other text, in exactly this s
     }
   };
 
+  // The X on the search box: leave search completely, without discarding the
+  // board or stranding the user on a search-only screen.
+  const clearSearch = () => {
+    setSearch("");
+    setAddCategoryOpen(false);
+    setTierSuggestion(null);
+    setTierError(null);
+    setTierResearching(false);
+    setDismissedSuggestions([]);
+    setNewBrandCategories(["Clothing"]);
+  };
+
   const goHome = () => {
     setProfileView(false);
     setClosetView(false);
@@ -1395,26 +1407,43 @@ Respond with ONLY raw JSON, no markdown fences, no other text, in exactly this s
         </div>
       )}
 
-      <input
-        value={search}
-        onChange={(e) => setSearch(e.target.value)}
-        placeholder="Search brands..."
-        style={{ ...fieldStyle, marginBottom: normalizedSearch ? "10px" : "16px" }}
-      />
+      <div style={{ position: "relative", marginBottom: normalizedSearch ? "10px" : "16px" }}>
+        <input
+          data-testid="brand-search"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Search brands..."
+          style={{ ...fieldStyle, paddingRight: normalizedSearch ? "40px" : undefined, marginBottom: 0 }}
+        />
+        {normalizedSearch && (
+          <button
+            data-testid="clear-search"
+            onClick={clearSearch}
+            aria-label="Clear search and return to the full tier list"
+            title="Clear search"
+            style={{
+              position: "absolute", top: 0, right: 0, height: "100%", width: "38px",
+              background: "none", border: "none", color: "#81776b", cursor: "pointer",
+              fontSize: "20px", lineHeight: 1, padding: 0, fontFamily: "inherit",
+            }}
+          >×</button>
+        )}
+      </div>
 
       {normalizedSearch && !existingSearchBrand && (
         <div style={{ marginBottom: "12px" }}>
-          {/* Near-matches from the catalog come first — a misspelling should not
-              quietly become a duplicate brand. */}
+          {/* Near matches come from local string distance only — no API call.
+              A misspelling should not quietly become a duplicate brand. */}
           {similarBrands.length > 0 && (
-            <div style={{ padding: "10px 12px", marginBottom: "10px", border: "1px solid #ded6ca", background: "#fffdfa" }}>
+            <div data-testid="did-you-mean" style={{ padding: "10px 12px", marginBottom: "10px", border: "1px solid #ded6ca", background: "#fffdfa" }}>
               <div style={{ fontSize: "12px", color: "#665d53", marginBottom: "8px" }}>
                 Did you mean{similarBrands.length > 1 ? " one of these" : ""}?
               </div>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", marginBottom: "10px" }}>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
                 {similarBrands.map((brand) => (
                   <button
                     key={brand.id}
+                    data-testid={`suggestion-${brand.id}`}
                     onClick={() => { setSearch(brand.name); openBrandModal(brand.id); }}
                     style={{ ...modalBtnStyle, borderColor: "#967342", color: "#211d17" }}
                   >
@@ -1422,29 +1451,35 @@ Respond with ONLY raw JSON, no markdown fences, no other text, in exactly this s
                   </button>
                 ))}
               </div>
-              <button
-                onClick={() => setDismissedSuggestions((current) => [...current, ...similarBrands.map((b) => b.id)])}
-                style={{ padding: 0, border: "none", background: "none", color: "#81776b", cursor: "pointer", fontFamily: "inherit", fontSize: "11px", fontStyle: "italic", textDecoration: "underline", textUnderlineOffset: "3px" }}
-              >
-                No, "{search.trim()}" is a different brand
-              </button>
             </div>
           )}
 
-          {similarBrands.length === 0 && !addCategoryOpen && (
-            <button
-              onClick={() => { setAddCategoryOpen(true); researchNewBrand(search.trim()); }}
-              style={btnStyle(true)}
-            >
-              + Add and rank brand
-            </button>
+          {/* Adding a genuinely new brand is always offered, and is the only
+              thing here that spends credits — it is kept visually separate from
+              the free local suggestions above. */}
+          {!addCategoryOpen && (
+            <div>
+              <button
+                data-testid="add-and-rank"
+                onClick={() => { setAddCategoryOpen(true); researchNewBrand(search.trim()); }}
+                style={btnStyle(true)}
+              >
+                + Add and rank "{search.trim()}" as new brand
+              </button>
+              <div style={{ fontSize: "11px", color: "#81776b", marginTop: "6px", fontStyle: "italic" }}>
+                Looks the brand up to suggest a starting tier. This is the only step that uses AI credits.
+              </div>
+            </div>
           )}
 
-          {similarBrands.length === 0 && addCategoryOpen && (
-            <div style={{ padding: "12px 14px", border: "1px solid #ded6ca", background: "#fffdfa" }}>
-              <div style={{ fontSize: "14px", color: "#211d17", marginBottom: "10px" }}>{search.trim()}</div>
+          {addCategoryOpen && (
+            <div data-testid="add-panel" style={{ padding: "12px 14px", border: "1px solid #967342", background: "#fffdfa" }}>
+              <div style={{ fontSize: "14px", color: "#211d17", marginBottom: "2px" }}>{search.trim()}</div>
+              <div style={{ fontSize: "11px", color: "#81776b", fontStyle: "italic", marginBottom: "10px" }}>
+                Not added yet — adjust anything below, then Save.
+              </div>
 
-              {tierResearching && <div style={{ fontSize: "12px", color: "#81776b", marginBottom: "10px" }}>Researching this brand to suggest a tier...</div>}
+              {tierResearching && <div data-testid="researching" style={{ fontSize: "12px", color: "#81776b", marginBottom: "10px" }}>Researching this brand to suggest a tier...</div>}
               {tierError && <div style={{ fontSize: "12px", color: "#996c6c", marginBottom: "10px" }}>{tierError}</div>}
 
               {tierSuggestion && (
@@ -1462,6 +1497,7 @@ Respond with ONLY raw JSON, no markdown fences, no other text, in exactly this s
                   return (
                     <button
                       key={tier.label}
+                      data-testid={`tier-${tier.label}`}
                       onClick={() => setTierSuggestion((current) => ({ ...(current || { name: search.trim(), reasoning: "", notes: "", categories: newBrandCategories }), tier: tier.label }))}
                       title={tier.desc}
                       style={{ padding: "6px 11px", border: "1px solid " + (active ? tier.color : "#cfc6ba"), background: active ? tier.bg : "#fffdfa", color: active ? tier.color : "#81776b", cursor: "pointer", fontFamily: "inherit", fontSize: "12px", fontWeight: active ? "bold" : "normal" }}
@@ -1483,6 +1519,7 @@ Respond with ONLY raw JSON, no markdown fences, no other text, in exactly this s
 
               <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                 <button
+                  data-testid="save-brand"
                   disabled={!newBrandCategories.length || tierResearching}
                   onClick={() => handleAddBrand(search.trim(), newBrandCategories, tierSuggestion?.tier || "F", tierSuggestion?.notes || "")}
                   style={modalBtnStyle}
@@ -1496,8 +1533,9 @@ Respond with ONLY raw JSON, no markdown fences, no other text, in exactly this s
         </div>
       )}
 
-      {(!normalizedSearch || existingSearchBrand) && (
-        <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: "8px", marginBottom: "14px", borderBottom: "1px solid #cfc6ba" }}>
+      {/* Toggle and tier board stay put while searching — search filters the
+          board, it never replaces the screen. */}
+      <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: "8px", marginBottom: "14px", borderBottom: "1px solid #cfc6ba" }}>
           <div style={{ display: "flex", gap: "0", flexShrink: 0 }}>
             {["tier", "ranked"].map((v) => (
               <button key={v} onClick={() => setView(v)} style={{
@@ -1512,18 +1550,26 @@ Respond with ONLY raw JSON, no markdown fences, no other text, in exactly this s
               <button key={category} onClick={() => setCategoryFilter(category)} style={{ padding: "5px 8px", border: "none", borderBottom: "1px solid " + (categoryFilter === category ? "#967342" : "transparent"), background: "transparent", color: categoryFilter === category ? "#302b25" : "#8b8175", cursor: "pointer", fontSize: "9px", letterSpacing: "0.06em" }}>{category}</button>
             ))}
           </div>
+      </div>
+
+      {normalizedSearch && !rankedSearchMatches && (
+        <div data-testid="no-matches" style={{ fontSize: "12px", color: "#81776b", marginBottom: "12px", fontStyle: "italic" }}>
+          No existing brands match "{search.trim()}" — showing your full list below.
         </div>
       )}
 
       {view === "tier" && (
         <div>
-          {normalizedSearch && !rankedSearchMatches ? null : (
+          {(
             TIER_CONFIG.map((tier) => {
+            // When the search matches nothing, show the unfiltered board rather
+            // than an empty screen the user has to escape from.
+            const filtering = normalizedSearch && rankedSearchMatches;
             const tierBrands = ranked.filter((r) => r.tier === tier.label).map((r) => r.id).filter(id => {
               const b = getBrand(id);
-              return b && brandMatchesCategory(b) && matchesSearch(b);
+              return b && brandMatchesCategory(b) && (!filtering || matchesSearch(b));
             });
-            if (normalizedSearch && tierBrands.length === 0) return null;
+            if (filtering && tierBrands.length === 0) return null;
             const isOver = dragOver === "tier-" + tier.label;
             return (
               <div key={tier.label}
@@ -1551,11 +1597,11 @@ Respond with ONLY raw JSON, no markdown fences, no other text, in exactly this s
       {view === "ranked" && (
         <div>
           {TIER_CONFIG.map((tier) => {
+            const filtering = normalizedSearch && rankedSearchMatches;
             const tierBrands = ranked.filter((r) => r.tier === tier.label).filter(r => {
-              if (!search) return true;
               const b = getBrand(r.id);
-              return b && brandMatchesCategory(b) && matchesSearch(b);
-            }).filter((r) => brandMatchesCategory(getBrand(r.id)));
+              return b && brandMatchesCategory(b) && (!filtering || matchesSearch(b));
+            });
             if (!tierBrands.length) return null;
             const startRank = rankedSorted.findIndex((r) => r.tier === tier.label) + 1;
             return (
